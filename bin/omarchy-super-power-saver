@@ -16,8 +16,10 @@
 #              uncore freq floor, render-GT capped to efficient freq (media GT
 #              left SLPC-managed for video decode), SLPC power_saving profile
 #              (gt0+gt1), LP-E consolidation: P-cores 1-5 AND E-cores 6-13
-#              offline + user/system/machine.slice pinned to the LP-E island
-#              (cpu14-15, SoC tile) + all device IRQs steered there, PSR2
+#              offline + user/system/machine.slice pinned to cpu0 + the LP-E
+#              pair (default SPS_ALLOWED_CPUS=0,14-15 since the measured A/B
+#              2026-07-08; strict LP-E pin one conf line away) + device IRQs
+#              steered to the same set, PSR2
 #              assert, fingerprint autosuspend, snd_hda power_save 1s,
 #              snapper-timeline.timer paused, nmi_watchdog=0, writeback 60s.
 # Deliberately untouched: Hyprland animations/blur/shadows (identical in ALL
@@ -92,7 +94,7 @@ ac_fingerprint() {
 # mid-flight (the v3 AC-auto-exit bug class).
 detached_off() {
   systemd-run --user --collect --unit="$WATCH_UNIT-reconcile" \
-    "$SELF" off auto 2>/dev/null
+    "$SELF" off reconcile 2>/dev/null
 }
 
 # Watcher body (internal, run inside the transient unit): the mode PERSISTS on
@@ -109,9 +111,10 @@ detached_off() {
 do_watch_loop() {
   # Nothing to defend when the root half never applied (setup not run).
   [[ $(read_state root_applied) == yes ]] || exit 0
-  local exp_pl1 exp_cpu6 last cur drift
+  local exp_pl1 exp_cpu6 exp_pin last cur drift
   exp_pl1=$(read_state watch_pl1); : "${exp_pl1:=10000000}"
   exp_cpu6=$(read_state watch_cpu6); : "${exp_cpu6:=0}"
+  exp_pin=$(read_state watch_pin) # may be empty (unpinned variant) — stable
   last=$(ac_fingerprint)
   while true; do
     sleep 60
@@ -126,6 +129,9 @@ do_watch_loop() {
     [[ $(cat /sys/firmware/acpi/platform_profile 2>/dev/null) == quiet ]] || drift=1
     [[ $(cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw 2>/dev/null) == "$exp_pl1" ]] || drift=1
     [[ $(cat /sys/devices/system/cpu/cpu6/online 2>/dev/null) == "$exp_cpu6" ]] || drift=1
+    # cgroup pin: a dropped AllowedCPUs unconfines userspace with none of the
+    # other canaries moving (found in audit 2026-07-08)
+    [[ $(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null) == "$exp_pin" ]] || drift=1
     cur=$(ac_fingerprint)
     if [[ $drift == 1 || $cur != "$last" ]]; then
       if [[ ! -f $RUN_STATE_ROOT ]]; then
@@ -134,9 +140,14 @@ do_watch_loop() {
         detached_off
         exit 0
       fi
-      if [[ -x $HELPER ]] && timeout 90 sudo -n "$HELPER" reassert 2>/dev/null; then
+      # 180s > helper worst case (20s flock + serial 25s systemctl timeouts)
+      if [[ -x $HELPER ]] && timeout 180 sudo -n "$HELPER" reassert 2>/dev/null; then
         exp_pl1=$(cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw 2>/dev/null)
         exp_cpu6=$(cat /sys/devices/system/cpu/cpu6/online 2>/dev/null)
+        exp_pin=$(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null)
+        # persist: a revived watcher (re-login boot-cleanup) must inherit the
+        # CURRENT expectations, not the on-time ones
+        sed -i "s/^watch_pl1=.*/watch_pl1=$exp_pl1/;s/^watch_cpu6=.*/watch_cpu6=$exp_cpu6/;s/^watch_pin=.*/watch_pin=$exp_pin/" "$STATE_FILE" 2>/dev/null
       fi
     fi
     last=$cur
@@ -156,7 +167,10 @@ stop_watcher() {
 }
 
 root_helper() {
-  if [[ -x $HELPER ]] && timeout 120 sudo -n "$HELPER" "$1" 2>/dev/null; then
+  # 300s > the helper's worst-case internal budget (flock 20s + a dozen serial
+  # 25s systemctl/ppd timeouts) — a shorter caller timeout would SIGTERM the
+  # helper mid-apply in exactly the wedged-D-Bus case those timeouts exist for.
+  if [[ -x $HELPER ]] && timeout 300 sudo -n "$HELPER" "$1" 2>/dev/null; then
     return 0
   fi
   notify-send -u normal "Super Power Saver" \
@@ -185,6 +199,20 @@ wifi_powersave_state() { # -> on|off|"" (last wireless iface wins; one on laptop
 
 do_on() {
   is_on && exit 0
+  # Root half still applied but user state lost/stale: reconcile to stock
+  # FIRST — snapshotting now would record the MODE's own values (profile
+  # power-saver, BT blocked, wifi powersave) as the "prior" state, and the
+  # eventual off would restore those instead of the user's real settings.
+  if [[ -f $RUN_STATE_ROOT ]]; then
+    stop_watcher
+    if [[ -x $HELPER ]] && ! timeout 300 sudo -n "$HELPER" off 2>/dev/null; then
+      notify-send -u critical "Super Power Saver" \
+        "Stale root state could not be cleared — not enabling. Run 'omarchy-super-power-saver off' and retry." 2>/dev/null
+      return 1
+    fi
+    # profile back to stock semantics before it gets snapshotted as "prior"
+    omarchy-powerprofiles-set 2>/dev/null
+  fi
   # A stale state file means we rebooted while the mode was on: clean up the
   # persistent leftovers BEFORE snapshotting, or they'd become the "baseline".
   # A removed legacy toggle needs a reload, or animations stay killed all
@@ -234,6 +262,7 @@ do_on() {
     echo "root_applied=$root_applied"
     echo "watch_pl1=$(cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw 2>/dev/null)"
     echo "watch_cpu6=$(cat /sys/devices/system/cpu/cpu6/online 2>/dev/null)"
+    echo "watch_pin=$(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null)"
   } >>"$STATE_FILE"
 
   omarchy-wifi-powersave on 2>/dev/null
@@ -248,13 +277,25 @@ do_on() {
 do_off() {
   local reason="${1:-manual}"
 
+  # A queued reconcile (spawned for a LOST user state) that lost the flock
+  # race to a manual 'on' must not tear down the freshly enabled mode.
+  if [[ $reason == reconcile ]] && is_on; then
+    return 0
+  fi
+
   if [[ ! -f $STATE_FILE ]]; then
     if [[ -f $RUN_STATE_ROOT ]]; then
       # User state lost while the root half is still applied: the helper holds
       # the pristine baseline (or falls back to the /etc defaults cache) — use
       # it. prev-profile/wifi snapshots are gone; stock semantics for those.
+      # A FAILED root restore (helper exit 75 on lock timeout, etc.) must not
+      # read as success: keep /run state for a retried off and say so.
       stop_watcher
-      [[ -x $HELPER ]] && timeout 120 sudo -n "$HELPER" off 2>/dev/null
+      if [[ -x $HELPER ]] && ! timeout 300 sudo -n "$HELPER" off 2>/dev/null; then
+        notify-send -u critical "Super Power Saver" \
+          "Root restore FAILED — CPU/RAPL/IRQ limits may still be active. Run 'omarchy-super-power-saver off' again." 2>/dev/null
+        return 1
+      fi
       omarchy-powerprofiles-set 2>/dev/null
       return 0
     fi
@@ -286,9 +327,14 @@ do_off() {
   # and a stale-state off must not fire the helper's no-state sledgehammer
   # restore at a freshly-booted stock system. A failed root restore keeps the
   # state file so the mode still reads 'on' and a later off can retry.
-  local root_off_ok=yes
-  if [[ $was_fresh == yes && -x $HELPER ]]; then
-    if ! timeout 120 sudo -n "$HELPER" off 2>/dev/null; then
+  # Only call the helper when the root half is actually live (root_applied=yes
+  # or /run state present): with sudoers missing and nothing applied, a failed
+  # helper call would otherwise keep the state file forever ('on' in the menu
+  # with no way off short of a reboot).
+  local root_off_ok=yes root_live=no
+  [[ $(read_state root_applied) == yes || -f $RUN_STATE_ROOT ]] && root_live=yes
+  if [[ $was_fresh == yes && $root_live == yes && -x $HELPER ]]; then
+    if ! timeout 300 sudo -n "$HELPER" off 2>/dev/null; then
       root_off_ok=no
       notify-send -u critical "Super Power Saver" \
         "Root restore FAILED — CPU/RAPL/IRQ limits may still be active. Re-run omarchy-super-power-saver-setup, then 'omarchy-super-power-saver off' again." 2>/dev/null
@@ -351,7 +397,7 @@ do_boot_cleanup() {
     [[ $had_legacy_toggle == yes ]] && hyprctl reload >/dev/null 2>&1
   elif is_on && ! systemctl --user is-active --quiet "$WATCH_UNIT.service"; then
     if [[ -f $RUN_STATE_ROOT ]]; then
-      [[ -x $HELPER ]] && timeout 90 sudo -n "$HELPER" reassert 2>/dev/null
+      [[ -x $HELPER ]] && timeout 180 sudo -n "$HELPER" reassert 2>/dev/null
       start_watcher
     elif [[ $(read_state root_applied) == yes ]]; then
       # 'off' crashed between the root restore and the user-side cleanup (or
@@ -360,6 +406,10 @@ do_boot_cleanup() {
       do_off auto
     fi
     # else: setup was never run for this activation — nothing to revive.
+  elif [[ ! -f $STATE_FILE && -f $RUN_STATE_ROOT ]]; then
+    # User state lost while root knobs are still applied and no watcher is
+    # around to reconcile: finish the off here (same-boot re-login case).
+    do_off auto
   elif [[ ! -f $STATE_FILE && -f $HYPR_TOGGLE ]]; then
     # Orphaned legacy v3 toggle, no state at all: without this branch it would
     # silently degrade the UI every boot, forever.

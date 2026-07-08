@@ -127,6 +127,9 @@ The correct screen-on target is package C10: `turbostat --show Pkg%pc10`.)
 
 ### v4 (2026-07-08) — LP-E island consolidation, invisible-only knobs
 
+> Superseded detail: v4 pinned slices/IRQs to `14-15`/mask `c000`; since
+> v4.2 the shipped default is `0,14-15`/mask `c001` (measured winner).
+
 Research-driven upgrade (5-agent web research + live sysfs recon + design
 review). New constraints honored: **no reboot** ever needed to toggle, **UI
 identical in all modes** (the v3 animations/blur/shadows kill is REMOVED — off
@@ -360,7 +363,7 @@ Three new `/etc/omarchy-super-power-saver.conf` keys (same guarded sourcing:
 root-owned, not group/other-writable, validated before use):
 
 - `SPS_ONLINE_CPUS` (default `0,14-15`) — offline set derived as complement
-- `SPS_ALLOWED_CPUS` (default `14-15`) — empty means "no cgroup pin"
+- `SPS_ALLOWED_CPUS` (default `0,14-15` since the quick-tier A/B shipped D; was `14-15`) — empty means "no cgroup pin"
 - `SPS_IRQ_STEER` (default `1`) — IRQ mask derived from pin set (else online set)
 
 Validation invariants (this feeds a NOPASSWD root shell): cpulist parts
@@ -538,3 +541,41 @@ harness/helper/installers. Deduplicated fixes:
 Also: chromium policy skip now visible, menu-extension staleness noted by
 install.sh. Two findings refuted (exec-redirect/cleanup interaction and
 SUDO_USER-unset derivation were fine as written).
+
+### v4.2.2 (2026-07-08) — mode-core audit (40 agents), 17 findings fixed
+
+Focused pass on the daily-use mode core (previous round leaned harness-ward).
+The three majors were state-machine holes in the "state lost / half-applied"
+corners:
+
+1. `off` with the helper installed but sudoers missing (and nothing root-side
+   applied) failed forever — state file kept, menu stuck "on" until reboot.
+   Helper-off now gated on the root half being live (root_applied=yes or /run
+   state present).
+2. `on` while the root half was still applied but the user state lost
+   snapshotted the MODE's own values as the "prior" state (profile
+   power-saver, BT blocked) — the eventual off restored those. `on` now
+   reconciles to stock first (helper off + stock profile), refusing to enable
+   if that fails.
+3. The lost-user-state `off` branch ignored the helper's exit status — a lock
+   -timeout failure read as success with the watcher already stopped: root
+   knobs stayed applied with nothing left to reconcile. Now mirrors the
+   normal path (critical notify, /run state kept for retry).
+
+Also fixed: boot-cleanup gets the missing lost-state-with-live-root branch
+(menu could previously stack profiles on top of applied root knobs); a
+queued watcher reconcile that loses the flock race to a manual `on` no
+longer tears the fresh mode down (distinct `off reconcile` reason,
+re-validated); watcher gains a cgroup-pin canary (a dropped AllowedCPUs was
+invisible to all four existing canaries) and persists re-observed
+expectations to the state file (revived watchers inherited stale ones);
+caller timeouts raised above the helper's worst-case internal budget
+(90/120s could SIGTERM a legitimately slow helper mid-restore; now 180/300s);
+exact-restore RAPL fallbacks end hardware-derived like the no-state branch
+(v3-state + missing defaults cache could leave the 10W cap); reassert
+removes a truncated /run state instead of looping the watcher on exit 3;
+SPS_CPUIDLE_GOV validated (was the only conf value reaching sysfs unchecked);
+diag documented as deliberately lock-free; stale topology text in the user
+script header, design notes v4.2 section, README, and install.sh manifest
+brought in line with the 0,14-15 default. One finding refuted (platform_
+profile snapshot is restored via ppd, not directly — correct as written).

@@ -141,7 +141,8 @@ Highlights of the failure-hardening:
   lost state (falls back to stock values cached at setup time)
 - reboot-while-on, crash-while-on, double-on, off-when-off: all converge to
   stock (`boot-cleanup` runs from Hyprland autostart)
-- helper verbs serialize on a `/run` flock; a reassert racing an `off` cannot
+- mutating helper verbs serialize on a `/run` flock (diag is read-only and
+  lock-free); a reassert racing an `off` cannot
   re-pin knobs after restore
 - writes are readback-verified; drift is logged and shown in `diag`
 

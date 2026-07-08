@@ -11,6 +11,9 @@
 #   ~/.local/bin/omarchy-super-power-saver-setup     root setup (you run it with sudo once)
 #   ~/.config/omarchy/extensions/menu.sh             power menu: 4th mode + active marker
 #   ~/.config/hypr/autostart.conf                    adds the boot-cleanup line (idempotent)
+#   ~/.config/environment.d/51-browser-igpu.conf     Firefox decode device -> iGPU by path
+#   ~/.config/chromium-flags.conf                    Chromium 148-verified battery flags (marker-aware)
+#   ~/.config/electron-flags.conf                    Electron hw-decode flags (marker-aware)
 #
 # Nothing here needs a reboot; the mode is runtime-only by design.
 

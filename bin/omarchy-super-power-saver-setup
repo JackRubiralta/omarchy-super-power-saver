@@ -57,7 +57,9 @@ cat >"$HELPER_TMP" <<'HELPER'
 #  - restore() gives EVERY knob a stock fallback (saved value -> cached
 #    default -> hardware-derived last resort), so a v3-era or partial state
 #    can never silently skip a restore (the no_turbo lesson, generalized).
-#  - All verbs serialize on a /run flock with a 20s timeout (exit 75) —
+#  - All MUTATING verbs (on/off/reassert) serialize on a /run flock with a
+#    20s timeout (exit 75); diag is deliberately lock-free (read-only, must
+#    work while an off is wedged) —
 #    a wedged D-Bus call must not silently queue every later on/off/reassert;
 #    unit stop/start use --no-block, method calls are wrapped in timeout.
 #  - dGPU (0000:01:00.0/.1) IRQs are never touched — the device is suspended
@@ -181,7 +183,13 @@ if [[ -f $CONF && $(stat -c %u "$CONF" 2>/dev/null) == 0 &&
   . "$CONF"
   [[ ${SPS_PL1_UW:-} =~ ^[0-9]+$ && ${SPS_PL1_UW:-0} -gt 0 ]] && PL1=$SPS_PL1_UW
   [[ ${SPS_PL2_UW:-} =~ ^[0-9]+$ && ${SPS_PL2_UW:-0} -gt 0 ]] && PL2=$SPS_PL2_UW
-  CPUIDLE_GOV=${SPS_CPUIDLE_GOV:-}
+  if [[ -n ${SPS_CPUIDLE_GOV:-} ]]; then
+    if [[ $SPS_CPUIDLE_GOV =~ ^[a-z_]+$ ]]; then
+      CPUIDLE_GOV=$SPS_CPUIDLE_GOV
+    else
+      conf_err "conf: bad SPS_CPUIDLE_GOV='${SPS_CPUIDLE_GOV}' — ignored"
+    fi
+  fi
   # Online set: must contain cpu0 (not hotpluggable — an online set without it
   # is a lie) and the LP-E pair 14-15 (the SoC-tile cores every variant keeps).
   if [[ -n ${SPS_ONLINE_CPUS:-} ]]; then
@@ -737,20 +745,23 @@ restore() {
     local f
     for f in /sys/devices/system/cpu/cpu*/power/energy_perf_bias; do w "$epb" "$f"; done
 
+    # Every RAPL fallback chain ends hardware-derived (constraint maxima /
+    # stock tau) — with a v3-era state AND a missing defaults cache, stopping
+    # at DEF_* left the mode's 10W cap in place (audit 2026-07-08).
     local val
-    val=$(get_saved rapl_msr_pl1); w "${val:-$DEF_RAPL_MSR_PL1}" "$RAPL_MSR/constraint_0_power_limit_uw"
-    val=$(get_saved rapl_msr_pl1_tau); w "${val:-$DEF_RAPL_MSR_TAU}" "$RAPL_MSR/constraint_0_time_window_us"
-    val=$(get_saved rapl_msr_pl2); w "${val:-$DEF_RAPL_MSR_PL2}" "$RAPL_MSR/constraint_1_power_limit_uw"
+    val=$(get_saved rapl_msr_pl1); w "${val:-${DEF_RAPL_MSR_PL1:-$(cat $RAPL_MSR/constraint_0_max_power_uw 2>/dev/null)}}" "$RAPL_MSR/constraint_0_power_limit_uw"
+    val=$(get_saved rapl_msr_pl1_tau); w "${val:-${DEF_RAPL_MSR_TAU:-28000000}}" "$RAPL_MSR/constraint_0_time_window_us"
+    val=$(get_saved rapl_msr_pl2); w "${val:-${DEF_RAPL_MSR_PL2:-$(cat $RAPL_MSR/constraint_1_max_power_uw 2>/dev/null)}}" "$RAPL_MSR/constraint_1_power_limit_uw"
     val=$(get_saved rapl_msr_enabled); w "${val:-${DEF_RAPL_MSR_ENABLED:-1}}" "$RAPL_MSR/enabled"
-    val=$(get_saved rapl_mmio_pl1); w "${val:-$DEF_RAPL_MMIO_PL1}" "$RAPL_MMIO/constraint_0_power_limit_uw"
-    val=$(get_saved rapl_mmio_pl1_tau); w "${val:-$DEF_RAPL_MMIO_TAU}" "$RAPL_MMIO/constraint_0_time_window_us"
-    val=$(get_saved rapl_mmio_pl2); w "${val:-$DEF_RAPL_MMIO_PL2}" "$RAPL_MMIO/constraint_1_power_limit_uw"
+    val=$(get_saved rapl_mmio_pl1); w "${val:-${DEF_RAPL_MMIO_PL1:-$(cat $RAPL_MMIO/constraint_0_max_power_uw 2>/dev/null)}}" "$RAPL_MMIO/constraint_0_power_limit_uw"
+    val=$(get_saved rapl_mmio_pl1_tau); w "${val:-${DEF_RAPL_MMIO_TAU:-28000000}}" "$RAPL_MMIO/constraint_0_time_window_us"
+    val=$(get_saved rapl_mmio_pl2); w "${val:-${DEF_RAPL_MMIO_PL2:-$(cat $RAPL_MMIO/constraint_1_max_power_uw 2>/dev/null)}}" "$RAPL_MMIO/constraint_1_power_limit_uw"
     val=$(get_saved rapl_mmio_enabled); w "${val:-${DEF_RAPL_MMIO_ENABLED:-1}}" "$RAPL_MMIO/enabled"
     # PL4: never write 0/empty to a peak-power limit (w guards empty; guard 0)
     local pl4
-    pl4=$(get_saved rapl_msr_pl4); pl4=${pl4:-$DEF_RAPL_MSR_PL4}
+    pl4=$(get_saved rapl_msr_pl4); pl4=${pl4:-${DEF_RAPL_MSR_PL4:-$(cat $RAPL_MSR/constraint_2_max_power_uw 2>/dev/null)}}
     [[ -n $pl4 && $pl4 != 0 ]] && w "$pl4" "$RAPL_MSR/constraint_2_power_limit_uw"
-    pl4=$(get_saved rapl_mmio_pl4); pl4=${pl4:-$DEF_RAPL_MMIO_PL4}
+    pl4=$(get_saved rapl_mmio_pl4); pl4=${pl4:-${DEF_RAPL_MMIO_PL4:-$(cat $RAPL_MMIO/constraint_2_max_power_uw 2>/dev/null)}}
     [[ -n $pl4 && $pl4 != 0 ]] && w "$pl4" "$RAPL_MMIO/constraint_2_power_limit_uw"
 
     val=$(get_saved aspm); w "${val:-${DEF_ASPM:-default}}" "$ASPM"
@@ -861,7 +872,10 @@ reassert() {
   # distinct "no root state" signal (callers reconcile instead of retrying).
   lock
   [[ -f $RUN_STATE ]] || exit 3
-  state_truncated && exit 3
+  # Remove a truncated state before bailing: the user-side watcher decides
+  # reconcile-vs-retry on file EXISTENCE — leaving the corpse would loop the
+  # watcher on exit-3 forever instead of reconciling to off.
+  state_truncated && { rm -f "$RUN_STATE"; exit 3; }
   apply_knobs
   exit 0
 }
