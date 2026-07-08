@@ -1,0 +1,282 @@
+#!/bin/bash
+
+# Super Power Saver — a 4th power mode layered on top of power-profiles-daemon's
+# power-saver, for maximum battery life. Managed by ~/.config/omarchy/extensions/menu.sh.
+#
+# Usage: omarchy-super-power-saver on|off|toggle|status|boot-cleanup
+#
+# User-level:  ppd power-saver, wifi powersave, bluetooth rfkill, drift-watcher
+#              (~60s, sysfs reads only — no D-Bus/sudo unless drift or an AC
+#              transition is seen). The mode PERSISTS on AC (no auto-exit) and
+#              self-defends against udev/ppd profile resets on plug/unplug.
+# Root-level (via sudoers-whitelisted helper, see omarchy-super-power-saver-setup, v4):
+#              platform_profile=quiet, thermald stopped, EPB=15, RAPL PL1=10W
+#              tau 8s / PL2=15W / PL4=25W (MSR+MMIO), pcie_aspm=powersupersave,
+#              uncore freq floor, render-GT capped to efficient freq (media GT
+#              left SLPC-managed for video decode), SLPC power_saving profile
+#              (gt0+gt1), LP-E consolidation: P-cores 1-5 AND E-cores 6-13
+#              offline + user/system/machine.slice pinned to the LP-E island
+#              (cpu14-15, SoC tile) + all device IRQs steered there, PSR2
+#              assert, fingerprint autosuspend, snd_hda power_save 1s,
+#              snapper-timeline.timer paused, nmi_watchdog=0, writeback 60s.
+# Deliberately untouched: Hyprland animations/blur/shadows (identical in ALL
+#              modes — the v3 toggle was removed 2026-07-08 by request; off
+#              still cleans up a legacy toggle file), keyboard backlight
+#              (custom tracker setup), USB autosuspend policy (fingerprint
+#              device is the one scoped exception, via the root helper), audio
+#              power_save policy outside the mode, screen brightness (measured
+#              <1W across the range), screensaver + idle-lock chain (stock in
+#              all modes, incl. this one).
+#
+# Scope guarantee: everything is applied on 'on' and restored on 'off'. State
+# that persists across reboots (bluetooth rfkill via systemd-rfkill, the
+# screensaver-off flag, the legacy hypr toggle conf) is restored even from a
+# stale (pre-reboot) state file; 'boot-cleanup' (run from hypr autostart)
+# handles a reboot that happened while the mode was on.
+
+set -u
+
+STATE_DIR="$HOME/.local/state/omarchy-super-power-saver"
+STATE_FILE="$STATE_DIR/state"
+# Legacy (v3): the mode used to disable animations/blur/shadows via this file.
+# v4 never creates it, but off/boot-cleanup still remove a leftover.
+HYPR_TOGGLE="$HOME/.local/state/omarchy/toggles/hypr/super-power-saver.conf"
+SS_FLAG="$HOME/.local/state/omarchy/toggles/screensaver-off"
+HELPER=/usr/local/bin/omarchy-super-power-saver-helper
+BACKLIGHT=/sys/class/backlight/intel_backlight
+WATCH_UNIT=omarchy-super-power-saver-watch
+SELF="$HOME/.local/bin/omarchy-super-power-saver"
+
+boot_id() { cat /proc/sys/kernel/random/boot_id; }
+
+read_state() { grep "^$1=" "$STATE_FILE" 2>/dev/null | cut -d= -f2; }
+
+state_stale() {
+  [[ -f $STATE_FILE ]] || return 0
+  [[ $(read_state boot_id) != "$(boot_id)" ]]
+}
+
+is_on() {
+  [[ -f $STATE_FILE ]] && ! state_stale
+}
+
+# Undo the changes that persist across reboots (rfkill state is re-applied at
+# boot by systemd-rfkill; the flag files live on disk). Safe to call with a
+# stale state file — that is exactly its job.
+restore_persistent_from_state() {
+  [[ -f $STATE_FILE ]] || return 0
+  [[ $(read_state bt_was_blocked) == no ]] && rfkill unblock bluetooth 2>/dev/null
+  if grep -q '^screensaver_disabled_by_us=yes' "$STATE_FILE"; then
+    rm -f "$SS_FLAG"
+  fi
+  rm -f "$HYPR_TOGGLE"
+}
+
+# One string that changes whenever any power supply's online state flips —
+# plug/unplug detection without udev or D-Bus.
+ac_fingerprint() {
+  local s="" p
+  for p in /sys/class/power_supply/*/online; do
+    [[ -r $p ]] && s+=$(cat "$p" 2>/dev/null)
+  done
+  echo "$s"
+}
+
+# Watcher body (internal, run inside the transient unit): the mode PERSISTS on
+# AC (user preference 2026-07-08 — no auto-exit). When AC is plugged/unplugged,
+# omarchy's udev rule resets the ppd profile and the EC rewrites MMIO RAPL; ppd
+# rewrites EPP/EPB on any profile change. Instead of blindly running the root
+# helper every tick (v3), poll cheap user-readable sysfs and only escalate to
+# `sudo helper reassert` on drift or an AC transition. MSR RAPL (not MMIO) is
+# the authoritative drift signal — the EC only rewrites MMIO, so EC noise can't
+# cause reassert storms. Expectations come from the state file's observed
+# post-apply values, so a version-skewed helper can't loop either.
+do_watch_loop() {
+  local exp_pl1 exp_cpu6 last cur drift
+  exp_pl1=$(read_state watch_pl1); : "${exp_pl1:=10000000}"
+  exp_cpu6=$(read_state watch_cpu6); : "${exp_cpu6:=0}"
+  last=$(ac_fingerprint)
+  while true; do
+    sleep 60
+    is_on || exit 0
+    drift=0
+    [[ $(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null) == power ]] || drift=1
+    [[ $(cat /sys/firmware/acpi/platform_profile 2>/dev/null) == quiet ]] || drift=1
+    [[ $(cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw 2>/dev/null) == "$exp_pl1" ]] || drift=1
+    [[ $(cat /sys/devices/system/cpu/cpu6/online 2>/dev/null) == "$exp_cpu6" ]] || drift=1
+    cur=$(ac_fingerprint)
+    if [[ $drift == 1 || $cur != "$last" ]]; then
+      [[ -x $HELPER ]] && sudo -n "$HELPER" reassert 2>/dev/null
+    fi
+    last=$cur
+  done
+}
+
+start_watcher() {
+  systemd-run --user --collect --unit="$WATCH_UNIT" "$SELF" watch-loop 2>/dev/null
+}
+
+stop_watcher() {
+  systemctl --user stop "$WATCH_UNIT.service" 2>/dev/null
+}
+
+root_helper() {
+  if [[ -x $HELPER ]] && sudo -n "$HELPER" "$1" 2>/dev/null; then
+    return 0
+  fi
+  notify-send -u normal "Super Power Saver" \
+    "CPU/RAPL/PCIe limits skipped — run omarchy-super-power-saver-setup once to enable them." 2>/dev/null
+  return 1
+}
+
+on_ac() {
+  local ps t
+  for ps in /sys/class/power_supply/*; do
+    [[ -r $ps/online && -r $ps/type ]] || continue
+    t=$(cat "$ps/type")
+    [[ ( $t == Mains || $t == USB ) && $(cat "$ps/online") == 1 ]] && return 0
+  done
+  return 1
+}
+
+do_on() {
+  is_on && exit 0
+  # A stale state file means we rebooted while the mode was on: clean up the
+  # persistent leftovers BEFORE snapshotting, or they'd become the "baseline".
+  if [[ -f $STATE_FILE ]] && state_stale; then
+    restore_persistent_from_state
+    rm -f "$STATE_FILE"
+  fi
+  mkdir -p "$STATE_DIR"
+
+  # Record prior state and PERSIST it before making any change (a crash
+  # between a change and its record would leak the change — bug-hunt finding).
+  local bt_present="" bt_was_blocked=""
+  if command -v rfkill >/dev/null && rfkill list bluetooth 2>/dev/null | grep -q .; then
+    bt_present=yes
+    rfkill list bluetooth | grep -q "Soft blocked: yes" && bt_was_blocked=yes || bt_was_blocked=no
+  fi
+
+  # NOTE: the screensaver and idle-lock chain are deliberately left stock in
+  # this mode (user requirement 2026-07-08) — no screensaver disable, no DPMS
+  # meddling. The screensaver_disabled_by_us handling in
+  # restore_persistent_from_state stays only to clean up old state files.
+  {
+    echo "v=4"
+    echo "boot_id=$(boot_id)"
+    echo "prev_profile=$(powerprofilesctl get 2>/dev/null)"
+    echo "bt_was_blocked=$bt_was_blocked"
+  } >"$STATE_FILE"
+
+  [[ $bt_present == yes ]] && rfkill block bluetooth 2>/dev/null
+
+  # Base profile first (EPP=power + platform quiet via ppd); helper then layers
+  # CPU/RAPL/PCIe/GPU/IRQ/cgroup/PSR knobs on top.
+  powerprofilesctl set power-saver 2>/dev/null
+  local extras="on"
+  root_helper on || extras="off (setup not run)"
+
+  # Watcher expectations = OBSERVED post-apply state, not hardcoded targets:
+  # correct under the /etc conf PL1 A/B variant and under a stale v3 helper
+  # (where cpu6 stays online — a hardcoded 0 would reassert forever).
+  {
+    echo "watch_pl1=$(cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw 2>/dev/null)"
+    echo "watch_cpu6=$(cat /sys/devices/system/cpu/cpu6/online 2>/dev/null)"
+  } >>"$STATE_FILE"
+
+  omarchy-wifi-powersave on 2>/dev/null
+
+  start_watcher
+  # No mode-change notifications (user preference 2026-07-08); $extras only
+  # surfaces via the root_helper failure notification when setup is missing.
+  : "$extras"
+}
+
+do_off() {
+  local reason="${1:-manual}"
+
+  # Guard: nothing to do and nothing leaked -> don't touch a stock system.
+  if [[ ! -f $STATE_FILE && ! -f $HYPR_TOGGLE ]]; then
+    echo "already off"
+    return 0
+  fi
+
+  stop_watcher
+
+  local was_fresh=""
+  is_on && was_fresh=yes
+
+  # Legacy v3 toggle: if present, its removal must be followed by a reload;
+  # a normal v4 off never touches Hyprland at all.
+  local had_legacy_toggle=""
+  [[ -f $HYPR_TOGGLE ]] && had_legacy_toggle=yes
+
+  # Root knobs FIRST (they only exist within a boot; helper no-ops safely
+  # regardless): the cgroup unpin at the top of its restore frees this script
+  # and everything it spawns from the 2x2.5GHz LP-E confinement before the
+  # user-side tail runs.
+  [[ -x $HELPER ]] && sudo -n "$HELPER" off 2>/dev/null
+
+  if [[ -f $STATE_FILE ]]; then
+    # Brightness restore: migration path for state files from the old version
+    local prev_brightness
+    prev_brightness=$(read_state prev_brightness)
+    if [[ -n $prev_brightness && -r $BACKLIGHT/brightness && $was_fresh == yes ]]; then
+      brightnessctl -d intel_backlight set "$prev_brightness" >/dev/null 2>&1
+    fi
+    # BT / screensaver / legacy hypr-toggle persist across reboots: restore
+    # even from a stale state file.
+    restore_persistent_from_state
+  fi
+
+  rm -f "$HYPR_TOGGLE"
+  [[ $had_legacy_toggle == yes ]] && hyprctl reload >/dev/null 2>&1
+
+  # Profile: restore what the user had before 'on' (stock semantics: a manual
+  # selection persists) — but only while still on battery. prev_profile was
+  # captured on battery; if AC got plugged since, stock AC semantics win.
+  local prev_profile
+  prev_profile=$(read_state prev_profile)
+  if [[ $reason == manual && $was_fresh == yes && -n $prev_profile ]] && ! on_ac; then
+    powerprofilesctl set "$prev_profile" 2>/dev/null
+  else
+    omarchy-powerprofiles-set 2>/dev/null
+  fi
+  if omarchy-ac-present 2>/dev/null; then
+    omarchy-wifi-powersave off 2>/dev/null
+  fi
+
+  rm -f "$STATE_FILE"
+  # No mode-change notifications (user preference 2026-07-08).
+}
+
+# Run from hypr autostart: if we rebooted while the mode was on, silently
+# clean the persistent leftovers (sysfs knobs reset at boot on their own).
+# If instead this is a same-boot re-login while the mode is ON, the watcher
+# unit died with the old session — revive it and re-pin the knobs, otherwise
+# drift would go undefended for the rest of the session (bug-hunt finding).
+do_boot_cleanup() {
+  if [[ -f $STATE_FILE ]] && state_stale; then
+    local had_legacy_toggle=""
+    [[ -f $HYPR_TOGGLE ]] && had_legacy_toggle=yes
+    restore_persistent_from_state
+    rm -f "$STATE_FILE"
+    [[ $had_legacy_toggle == yes ]] && hyprctl reload >/dev/null 2>&1
+  elif is_on && ! systemctl --user is-active --quiet "$WATCH_UNIT.service"; then
+    [[ -x $HELPER ]] && sudo -n "$HELPER" reassert 2>/dev/null
+    start_watcher
+  fi
+}
+
+case "${1:-status}" in
+on) do_on ;;
+off) do_off "${2:-manual}" ;;
+toggle) if is_on; then do_off; else do_on; fi ;;
+status) if is_on; then echo on; else echo off; fi ;;
+boot-cleanup) do_boot_cleanup ;;
+watch-loop) do_watch_loop ;; # internal: body of the transient watcher unit
+*)
+  echo "Usage: omarchy-super-power-saver on|off|toggle|status|boot-cleanup" >&2
+  exit 1
+  ;;
+esac

@@ -1,0 +1,320 @@
+# Power menu: visible "active" marker + 4th mode "Super Power Saver"
+
+**Added:** 2026-07-07 · Dell Pro Max 14 Premium (Core Ultra 9 285H + RTX PRO 2000) · Omarchy/Hyprland 0.55.2 · walker 2.16.2
+**Status:** installed and working. Root setup (`sudo ~/.local/bin/omarchy-super-power-saver-setup`)
+run 2026-07-07 21:51 — helper + sudoers + udev rule verified in place. NOTE: sudo
+doesn't search ~/.local/bin (secure_path), always call the setup by full path.
+
+## How to use
+
+- Menu: Super key menu → Setup → Power Profile → pick a mode. The active mode is
+  highlighted (accent color + tinted background + bold — no ✓, removed by request).
+- CLI: `omarchy-super-power-saver on|off|toggle|status|boot-cleanup`
+- The mode PERSISTS on AC (user preference 2026-07-08, replacing the earlier
+  auto-exit): a ~30s watcher re-pins every knob, which also undoes the
+  udev/ppd profile reset that AC plug/unplug events trigger. Only a manual
+  off/toggle (menu or CLI) ends the mode.
+- Mode changes are SILENT (user preference 2026-07-08) — the only notification
+  left is the error case: root helper missing (setup not run).
+- Switching between modes NEVER touches the GPU — the iGPU-only compositor change
+  below is permanent/login-time, not per-mode. dGPU on demand in any mode:
+  `prime-run <app>`.
+
+## Problem 1 — active power profile not shown as selected in the menu
+
+Omarchy's power menu already passes the active profile to walker as `-c <index>`.
+Verified in walker v2.16.2 source (src/renderers/mod.rs:61-63): `-c` takes a
+**1-based index** and its *only* effect is adding the CSS class `.current` to that
+row — it does NOT move the cursor (the cursor always sits on row 1, which is what
+made it look wrong). Omarchy's theme styles `.current` as `font-style: italic`
+only — near-invisible in monospace. Upstream PR basecamp/omarchy#5165 asking for a
+clearer marker was rejected ("It's using italics...").
+
+**Fix (two layers, both update-safe):**
+1. `~/.config/omarchy/extensions/menu.sh` — overrides `show_setup_power_menu`
+   (sourced by omarchy-menu at the end, official extension point). Passes the
+   active row as the preselect so walker tags it `.current`. (A `  ✓` suffix was
+   tried first; Jack preferred highlight-only, removed 2026-07-07.)
+2. `~/.config/omarchy/themes/aether/walker.css` (+ live copy in
+   `~/.config/omarchy/current/theme/walker.css`) — `.current` now gets accent
+   color + `alpha(@selected-text, 0.15)` background + bold. Because the theme css
+   is `@import`ed at the top of the stock style.css, the stock italic rule only
+   overrides `font-style`; color/background/weight survive. Re-apply after
+   `omarchy theme set` of a different theme (rule lives per-theme).
+
+## Problem 2 — 4th mode: Super Power Saver
+
+power-profiles-daemon hardcodes exactly 3 profiles (C enum, no config for custom
+ones — verified in ppd source), so the 4th mode is layered on top of power-saver:
+
+- `~/.local/bin/omarchy-super-power-saver` (on|off|toggle|status)
+- `~/.local/bin/omarchy-super-power-saver-setup` (run ONCE with sudo) installs:
+  - `/usr/local/bin/omarchy-super-power-saver-helper` — root sysfs knobs
+  - `/etc/sudoers.d/omarchy-super-power-saver` — NOPASSWD for exactly `helper on|off`
+  - `/etc/udev/rules.d/61-igpu-dev-path.rules` — stable `/dev/dri/igpu` symlink
+
+### What ON does (v2, 2026-07-07 — all restored on OFF)
+
+| Layer | Action | Why |
+|---|---|---|
+| ppd | `powerprofilesctl set power-saver` | EPP=power on all cores; ppd 0.30 maps this to platform_profile **quiet** on this Dell (verified — quiet is Dell's real low-power mode; "cool" raises fans) |
+| root | **thermald stopped** while active | in --adaptive mode thermald raises the MSR RAPL limit (defeating our cap; hardware enforces min(MSR,MMIO)). Safe at 10W: TjMax/PROCHOT protection is hardware. Restarted on OFF |
+| root | RAPL PL1=10W **tau=8s** / PL2=**15W** in **both** `intel-rapl:0` and `intel-rapl-mmio:0` | min(MSR,MMIO) governs. Short tau fixes the measured slow 23→15W burst convergence (old window 28s). Watcher re-asserts every ~30s (throttled-project precedent — EC rewrites MMIO on profile changes) |
+| root | EPB=15 all cpus | package-controller powersave hint, additive to EPP |
+| root | **uncore freq capped to floor** (400MHz, `intel_uncore_frequency`) | ring/fabric power is a big slice at light load — biggest untapped lever per research |
+| root | **P-cores 1-5 offlined** (cpu0 stays) | ~0.5-0.7W light-load saving measured on comparable hw (Framework 13); ChromeOS battery saver does the same. Idle cores in C-states cost ~0, so this only helps by consolidating work |
+| root | **iGPU (gt0+gt1) max+boost capped to RP1=800MHz** | efficient frequency; never below RPn (worse perf/W). ~0 idle, 0.3-1W during scroll/animations |
+| root | `pcie_aspm=`**`powersupersave`**, `nmi_watchdog=0`, `dirty_writeback=6000`, `laptop_mode=5` | L1.2 substates are a PRECONDITION for deep package C-states (PC10/S0ix — was ~0s residency!); 2025+ consensus (Framework et al.) is powersupersave is safe on Core Ultra; per-device opt-out exists at `.../link/l1_2_aspm` if something gets flaky |
+| user | **bluetooth rfkill block** (previous state restored) | ~0.1-0.3W; no BT devices in use on this machine |
+| user | animations/blur/shadows off via `~/.local/state/omarchy/toggles/hypr/super-power-saver.conf` + `hyprctl reload` | toggles dir is sourced LAST by hyprland.conf so it survives other reloads. hyprlang needs multi-line blocks — one-line `animations { enabled = 0 }` is silently ignored! |
+| user | `omarchy-wifi-powersave on` | |
+| user | transient user unit `omarchy-super-power-saver-watch`: polls AC every 15s → auto `off`; every ~30s `sudo helper reassert` (RAPL re-pin + re-stop thermald) | mirrors omarchy's udev AC behavior + protects caps from EC/thermald |
+
+**Removed in v2 (measurement-driven):** screen brightness dim (<1W on this panel,
+isolated A/B) and `no_turbo=1`/`max_perf_pct=50` (measured WORSE at fixed light
+load — race-to-idle wins; TLP/ChromeOS/Windows all avoid turbo-off and use
+EPP+power caps instead, which we do via RAPL).
+
+### v3 (2026-07-08) — browsing/YouTube focus + audited mode-scoping
+
+Changes (helper v3 + user script, installed via re-running setup):
+- **Media-GT fix:** gt1 (video decode engine) is no longer capped — its fused
+  RP1=RPn=100MHz meant v2's "cap to RP1" pinned the decoder 13x below its
+  1300MHz operating point. Only gt0 (render) is capped, to 800 (= its floor).
+- **PSR2 assert** (debugfs `i915_edp_psr_debug`=2, conditional) on apply + each
+  ~30s reassert — also heals the documented DPMS-wake PSR2→PSR1 downgrade.
+  Runtime-only; kernel-param PSR/DC changes (`/etc/modprobe.d/i915-powersave.conf`
+  with `enable_dc=4 enable_fbc=1`) are GATED on a 2-3 day low-brightness flicker
+  soak (this Dell class has documented PSR flicker reports).
+- **Fingerprint sensor** (Synaptics 06cb:0701) autosuspend while mode on, by
+  USB ID; global usbcore autosuspend=-1 policy untouched.
+- **`diag` subcommand** (sudoers now on|off|reassert|diag): PSR/DC status, RAPL,
+  GT freqs, S0ix/pmc_core substates + LTR (for chasing the S0ix=0 blocker),
+  fingerprint state, turbostat if installed.
+- ~~Screensaver disabled while mode on~~ and ~~hypridle 330s screen-off~~ —
+  both REMOVED 2026-07-08 per Jack: the screensaver and idle-lock chain stay
+  100% stock in every mode including super saver. hypridle.conf is back to its
+  pre-project content. (Cost: the animated screensaver defeats PSR/RC6 when
+  idle-unattended in super mode — accepted trade-off for unchanged behavior.)
+- Setup now also installs intel-gpu-tools/libva-utils/nvme-cli and caches stock
+  RAPL values to `/etc/omarchy-super-power-saver.defaults` (used by the
+  helper's no-state fallback restore).
+
+Mode-scoping guarantee (user requirement; adversarially audited 2026-07-08):
+- Everything the mode changes is restored on off — including across reboots:
+  BT rfkill / screensaver flag / hypr effects conf persist on disk, so `off`
+  restores them even from a stale state file, and `boot-cleanup` (hypr
+  autostart) handles reboots that happened while the mode was on.
+- Audit fixes: AC-plug auto-exit no longer kills itself mid-restore (the
+  watcher's `off` now runs as a detached unit + do_off skips stop_watcher for
+  ac-auto); manual off restores the profile you had before on (prev_profile in
+  state); RAPL `enabled` flags and per-GT freqs are saved/restored exactly;
+  `off` when already off is a guarded no-op.
+- Global-but-invisible (kept, identical in all modes): Chromium VAAPI flags
+  (also fixed omarchy's split --enable-features lines silently dropping
+  features — Chromium takes the LAST line only), mpv hwdec/dmabuf-wayland.
+- Reverted after scoping review (would have changed other modes): Firefox
+  user.js prefs (kept as comments), GTK caret blink, waybar intervals.
+  enhanced-h264ify extension NOT installed (would cap YT at 1080p globally) —
+  optional manual install if wanted.
+
+**v2 verification targets:** `/sys/devices/system/cpu/cpuidle/low_power_idle_system_residency_us`
+(S0ix; was ~0 — should start advancing at idle with ASPM L1.2), burst draw should
+pin at ~10-12W quickly (short tau), light load should drop below balanced's 4.5W.
+(v4 note: `low_power_idle_system_residency_us` counts SLP_S0 assertion, which
+effectively needs display-off s2idle — 0 with screen on is EXPECTED, not a bug.
+The correct screen-on target is package C10: `turbostat --show Pkg%pc10`.)
+
+### v4 (2026-07-08) — LP-E island consolidation, invisible-only knobs
+
+Research-driven upgrade (5-agent web research + live sysfs recon + design
+review). New constraints honored: **no reboot** ever needed to toggle, **UI
+identical in all modes** (the v3 animations/blur/shadows kill is REMOVED — off
+still cleans a legacy toggle file), everything runtime-revertible.
+
+New knobs (root helper v4; all saved→applied→exactly restored, reassert-idempotent):
+
+| Knob | Action | Why / expected |
+|---|---|---|
+| **LP-E consolidation** | E-cores cpu6-13 offlined too (P 1-5 already were; cpu0 not hotpluggable) + `user/system/machine.slice` runtime-pinned to `AllowedCPUs=14-15` | userspace runs on the LP-E island (SoC tile); the compute tile stops lighting up for background noise. Biggest lever, est. 0.3–1W |
+| **IRQ steering** | all non-managed IRQs + `default_smp_affinity` → cpu14-15 (mask c000); nvme managed IRQs EIO-skip; **dGPU 01:00.0/.1 IRQs never touched** | IRQs stop waking the compute tile; prior art: intel-lpmd, MTL measurements (PC2 0.27%→9.3%) |
+| **GPU SLPC profile** | `gt0+gt1 slpc_power_profile=power_saving` | kills waitboost (which bypassed the gt0 800MHz cap); gt1 freq RANGE untouched (fused RP1=100 gotcha) |
+| **RAPL PL4** | constraint_2 → 25W in MSR+MMIO (stock 205W; never write 0) | free spike clamp |
+| **Audio** | `snd_hda_intel power_save` 10s→1s | ~0.1W when audio idle |
+| **Snapper** | `snapper-timeline.timer` stopped while on (restarted iff was active) | hourly CPU+NVMe bursts can't wreck long idle |
+| **A/B knobs (default OFF)** | `/etc/omarchy-super-power-saver.conf` (root:root 644): `SPS_CPUIDLE_GOV=teo`, `SPS_PL1_UW=7000000`, `SPS_PL2_UW=10000000` | only sourced if root-owned & not group/other-writable (feeds a root shell); toggle off→on to apply |
+
+Engineering changes:
+- **Watcher v4**: the 30s `sudo helper reassert` loop is gone. A 60s loop reads
+  user-readable sysfs only (cpu0 EPP, platform_profile, **MSR** PL1 —
+  authoritative, the Dell EC only rewrites MMIO — cpu6 online, AC online
+  fingerprint) and escalates to sudo only on drift or AC transition.
+  Expectations are the OBSERVED post-apply values (`watch_pl1`, `watch_cpu6`
+  in the state file) so a version-skewed helper or a PL1 A/B variant can't
+  cause a reassert storm. Runs as `omarchy-super-power-saver watch-loop`
+  inside the transient unit.
+- **flock serialization**: helper on/off/reassert take a lock on
+  `/run/omarchy-super-power-saver.lock`; reassert re-checks the state file
+  after acquiring (an in-flight reassert racing `off` would re-pin everything
+  after restore).
+- **Unconditional stock resets** (the no_turbo lesson, extended): on ANY off —
+  even with a v3-era or lost state file — cpu1-13 re-onlined, `AllowedCPUs=`
+  reset (+ drop-in removal fallback if the empty assignment didn't take), IRQs
+  swept to the cached stock mask, slpc→base, snd→10, governor→menu. All stock
+  values are verified constants that nothing else manages.
+- **Ordering** (the hard part): ON = save-everything-first → …v3 knobs… →
+  cgroup pin → IRQ steer → offline (tasks migrate while all CPUs online; IRQ
+  masks already on LP-E when hotplug runs → zero churn; cgroup v2 cpuset is
+  declarative so effective sets recompute cleanly). OFF = cgroup unpin FIRST
+  (restore escapes the 2×2.5GHz confinement) → re-online → IRQ restore (saved
+  masks referencing offline CPUs would EINVAL; kernel revives managed nvme
+  queues on re-online first) → the rest. The keyless-IRQ sweep closes the one
+  real leak: an IRQ allocated while on inherits the LP default mask and has no
+  saved key.
+- `w()` refuses empty values (v3 wrote blank lines on cross-version restore);
+  `wv()` readback-verifies RAPL/online writes and logs drift to
+  `/run/omarchy-super-power-saver.drift` (shown in `diag`; MMIO entries are
+  expected EC behavior).
+- `apply()` never re-snapshots over an existing /run baseline (double `on`
+  would have captured mode values as "stock").
+- `diag` extended: IRQ pin counts, slice AllowedCPUs + effective cpuset, SLPC
+  profiles, PL4, snapper/thermald, cpuidle governor, drift log, `CPU%LPI` in
+  the turbostat line. Setup now also installs `linux-tools` (turbostat).
+
+Verification tooling:
+- `power-mode-test-data/power-mode-scope-test.sh` — scope-exactness test:
+  snapshots ~50 knobs (sysfs, systemd slices, IRQ table hash, hyprctl
+  animation options), toggles on (sanity asserts: cpus_online=0,14-15,
+  cpuset=14-15, slpc=[power_saving], PL4=25W, snapper inactive, animations
+  UNCHANGED), toggles off, diffs pre vs post — must be byte-identical. Run
+  with mode off; don't plug/unplug AC or USB mid-run.
+
+Rejected after research (so nobody re-tries them): PCI runtime-PM sweep for
+the remaining `control=on` devices (verified no-op — those drivers have no
+runtime-suspend callbacks: nvme, ISH, proc_thermal, CNVi wifi), NVMe APST
+tuning (100ms default already admits the deepest state), refresh-rate/VRR
+(panel is 60Hz-only, no vrr_capable), Panel Replay force (AUX-less-ALPM gate
+fails), xe driver switch (same display code, breaks AQ_DRM_DEVICES), waybar
+SIGSTOP / terminal cursor-blink-off / cursor inactive_timeout (visible UX —
+excluded by the all-modes-identical rule), iwlwifi power_save=Y module reload
+(5-10s wifi drop per toggle), i915 enable_dc=4/enable_fbc (reboot-scoped;
+DC5/DC6 already reached at defaults — 2412 DC5→DC6 transitions in diag).
+
+State: `~/.local/state/omarchy-super-power-saver/state` (has boot_id → stale
+state after reboot is auto-detected; sysfs resets at boot anyway; root helper
+state in /run). Deliberately untouched: keyboard backlight (see
+dell-kbd-backlight-always-on.md), USB autosuspend (disabled system-wide via
+/etc/modprobe.d on purpose), audio power_save (already 10/Y).
+
+## Problem 3 — NVIDIA dGPU and battery (side findings)
+
+- RTD3 fine-grained **already works** (nvidia-open 610, DynamicPowerManagement=3
+  default): `runtime_status=suspended`, "Video Memory: Off" even with Hyprland
+  holding /dev/nvidia0. **Never check with nvidia-smi — it wakes the GPU
+  (~9.9W for ~20-25s).** Safe checks:
+  `cat /sys/bus/pci/devices/0000:01:00.0/power/runtime_status` and
+  `cat /proc/driver/nvidia/gpus/0000:01:00.0/power`.
+- `~/.config/uwsm/env-hyprland` now sets `AQ_DRM_DEVICES=/dev/dri/igpu`
+  (guarded on symlink existing; effective next login) so Aquamarine never opens
+  the dGPU as KMS device. As of 2026-07-07 22:00 the current session predates
+  this (Hyprland from 20:36 still holds /dev/nvidia0 — harmless, GPU suspends
+  anyway); takes effect on next logout/login. Safe here: ALL physical connectors
+  (eDP-1, HDMI-A-1, DP-3..6) are on the Intel card (00:02.0); nvidia card1 only
+  exposes disconnected DP-1/DP-2. Test each physical port once after relogin; if
+  one is dead, use `AQ_DRM_DEVICES=/dev/dri/igpu:/dev/dri/card1`. Revert:
+  comment the export, relogin.
+- `~/.config/hypr/envs.conf` (LIBVA_DRIVER_NAME=nvidia etc.) was **never
+  sourced** by hyprland.conf — the dGPU-forcing lines were inert; removed so a
+  future sourcing change can't silently kill battery. dGPU on demand:
+  `prime-run <app>`.
+- If >200MB VRAM stays allocated by some app, GPU won't fully suspend
+  (`NVreg_DynamicPowerManagementVideoMemoryThreshold`); find culprits with
+  `sudo lsof +c0 /dev/nvidia*` (safe, doesn't wake it).
+- Nuclear option (0W guaranteed, reboot each way): `omarchy-toggle-hybrid-gpu`
+  → Integrated (supergfxd; targets Asus-style hybrids — untested on this Dell).
+
+## Measured power draw & runtime (2026-07-07, on battery, dGPU suspended)
+
+Battery: 72Wh label = 70.3Wh design = **67.6Wh actual** (96% health, 135 cycles;
+verified vs Dell manual + sysfs). Runtime = 67.6Wh × 0.96 reserve ÷ mean W.
+Protocol: per mode 60s settle → 180s idle sampling → 90s fixed-work light load
+(2×74MB/s sha256, ≈ light browsing) → 20s all-core burst; hypridle paused,
+machine untouched; EC refreshes battery telemetry ~1Hz, sampled at 2s.
+
+| Mode | Idle W (mean/med) | Light load W | Burst W | Runtime idle / light |
+|---|---|---|---|---|
+| Performance | 6.84 / 4.97 (spiky, max 24) | 6.76 | **65** | 9.5h / 9.6h |
+| Balanced | 4.80 / 4.24 | 4.51 | 27 | 13.5h / 14.4h |
+| Power Saver | 4.77 / 4.32 | 4.65 | 27 | 13.6h / 13.9h |
+| Super Power Saver | 4.51 / 4.21 | 5.23 | 22→15 falling | 14.4h / 12.4h |
+
+Findings:
+- **Performance mode costs ~2W at idle** (turbo racing on background noise,
+  spikes to 24W) → ~4h less battery for zero benefit when not loaded.
+- **Dell EC uses different power tables on battery**: balanced/quiet cap the
+  package at ~27W on battery (vs 70W PL1 on paper); performance unlocks 65W
+  even on battery (→ ~1h runtime under sustained load!). Super's RAPL 10W cap
+  was converging (23→15W across the 20s burst; tau=28s window) → sustained
+  heavy load in super ≈ 11-12W ≈ 5h+ vs 1h in performance.
+- **Fixed-work light load: super is slightly WORSE than balanced** (5.2 vs
+  4.5W) — race-to-idle beats forced-slow (no_turbo+max_perf_pct=50) at tiny
+  loads on this silicon. Super's value is idle floor + load worst-case caps.
+- **Backlight is a non-lever on this panel**: isolated A/B 400 vs 100 vs 40 raw
+  showed <1W delta (within noise) — literature expected 2-3.5W. Panel is
+  unusually efficient; don't count screen dim as a saving here.
+- Idle floor 4.2-4.8W matches the expected 3-6.5W class band; light-use 12-14h
+  matches reviewers' "+5h vs OLED" estimate for the IPS panel (OLED/Windows
+  reviews: 7h21m-8h29m office).
+- Known risk (untested): thermald --adaptive drives intel-rapl-mmio from Dell
+  DPTF tables and may rewrite super's 10W cap under sustained load; if super's
+  load draw creeps to 45W, that's thermald — re-assert or stop thermald.
+
+Raw data + test script: ./power-mode-test-data/ (580 samples, 0 not-discharging warns).
+
+## Incidents & fixes log
+
+- **2026-07-08 deep bug-hunt (74-agent adversarial pass, 5 confirmed / 26 refuted),
+  all fixed in v3.3:**
+  1. reassert only re-pinned RAPL/PSR — ppd profile rewrites (udev fires
+     omarchy-powerprofiles-set on every power_supply uevent → balanced → EPB 8,
+     platform balanced) could silently degrade the mode for the whole session.
+     Now reassert re-pins EVERY knob via idempotent apply_knobs() with drift
+     guards (profile/platform only written when changed — each platform write
+     makes the EC rewrite MMIO RAPL).
+  2. Same-boot re-login killed the watcher while state said "on" → no AC
+     auto-exit ever again. boot-cleanup (hypr autostart) now revives the
+     watcher + reasserts when mode is on but the unit is dead.
+  3. Manual off after plugging AC restored the stale battery-time profile;
+     now prev_profile only restores while still on battery, else stock
+     omarchy-powerprofiles-set semantics.
+  4. Turning the mode on while on AC caused pointless apply→auto-revert churn;
+     do_on now refuses on AC with a notification.
+  5. BT was rfkill-blocked before its prior state hit disk (crash window =
+     permanent soft-block, systemd-rfkill persists it) — state is written
+     first now.
+
+- **2026-07-08: no_turbo/max_perf leak into all modes.** Mode was turned on
+  under helper v1 (which set no_turbo=1/max_perf_pct=50 and saved them in its
+  /run state), setup was re-run (v2+ helpers no longer manage those knobs),
+  then off ran → the newer restore() didn't know the old keys → 50%-capped
+  no-turbo CPU in every mode until noticed. Fix: helper restore() now
+  UNCONDITIONALLY resets no_turbo=0 and max_perf_pct=100 (they're stock
+  defaults and nothing else manages them). Lesson: on/off must be
+  version-paired — after re-running setup, always toggle the mode off with the
+  same helper generation that turned it on, or rely on unconditional resets.
+- **2026-07-08: hypridle (idle lock) found dead twice.** Cause: restarts
+  spawned from assistant tool shells die with the shell (`setsid`/`uwsm-app &`
+  insufficient). Fix: `systemd-run --user --collect --unit=hypridle-session hypridle`
+  — survives; omarchy's own autostart takes over at next login.
+
+## Gotchas learned
+
+- walker `-c` needs a 1-based index; 0 disables; it never moves the cursor.
+- ppd re-applies EPP on every AC transition and profile change — layer on top of
+  power-saver, never fight it. `no_turbo=1` makes ppd report
+  "performance-degraded: high-operating-temperature"; harmless.
+- Omarchy udev rule (99-power-profile.rules) resets the profile on every AC
+  plug/unplug — super-saver's AC watcher makes that coherent (auto-exit).
+- hyprctl reload reverts keyword-set options but NOT `keyword env` vars.
+- `hyprctl getoption misc:vfr` doesn't exist on 0.55.2 — it's `debug:vfr`,
+  default on; leave it.
