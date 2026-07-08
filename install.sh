@@ -41,6 +41,13 @@ install -m 755 "$HERE/bin/omarchy-super-power-saver" "$BIN/"
 install -m 755 "$HERE/bin/omarchy-super-power-saver-setup" "$BIN/"
 echo "installed $BIN/omarchy-super-power-saver{,-setup}"
 
+# Pin Firefox's VAAPI/DMABuf device to the Intel iGPU by stable path — on this
+# hardware class the render-node NUMBERS can map the NVIDIA card to the
+# "usual" renderD128, and a wrong pick wakes the dGPU (~9.9W). Takes effect at
+# next login.
+install -D -m 644 "$HERE/config/51-browser-igpu.conf"   "$HOME/.config/environment.d/51-browser-igpu.conf"
+echo "installed ~/.config/environment.d/51-browser-igpu.conf (MOZ_DRM_DEVICE -> iGPU; active next login)"
+
 # Power menu extension: only install fresh; never clobber user customizations.
 if [[ -f $EXT/menu.sh ]]; then
   if grep -q 'Super Power Saver' "$EXT/menu.sh"; then

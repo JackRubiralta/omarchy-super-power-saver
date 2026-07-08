@@ -1,0 +1,18 @@
+{
+  "_comment": "omarchy-super-power-saver: battery-oriented Firefox defaults. Installed to /etc/firefox/policies/policies.json by the setup script (only if none exists). Status:'default' = sets the DEFAULT branch each startup: survives updates, applies to all profiles, and any user about:config change still wins. VAAPI hw video decode needs NO prefs in Firefox >= 137 (on by default; media.ffmpeg.vaapi.enabled no longer exists).",
+  "policies": {
+    "DisableTelemetry": true,
+    "Preferences": {
+      "browser.sessionstore.interval": {
+        "_comment": "session-restore disk write every 15s -> 60s: quarters constant disk/CPU wakeups; costs <=60s of tab state on a hard crash",
+        "Value": 60000,
+        "Status": "default"
+      },
+      "network.captive-portal-service.enabled": {
+        "_comment": "periodic HTTP probes off; portal pages on hotel wifi need manual visit to neverssl.com",
+        "Value": false,
+        "Status": "default"
+      }
+    }
+  }
+}

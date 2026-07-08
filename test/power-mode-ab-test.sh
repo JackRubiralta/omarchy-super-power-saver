@@ -66,6 +66,11 @@ META="$OUT/meta.txt"
 LOG="$OUT/log"
 WORK_FILE=/tmp/sps-ab-work.bin
 VIDEO_FILE=/tmp/sps-ab-video.mp4
+VIDEO_HTML=/tmp/sps-ab-video.html
+BROWSE_DIR=/tmp/sps-ab-browse
+# gt1 is the iGPU MEDIA engine: sustained nonzero actual frequency during
+# playback = hardware decode engaged; 0 = software decode on the CPU.
+GT1_ACT=/sys/class/drm/card0/gt/gt1/rps_act_freq_mhz
 
 # Timers that could fire mid-run and contaminate exactly one variant's window;
 # active ones are stopped for the whole run (fairness: super pauses snapper
@@ -479,6 +484,123 @@ PY
   }
 }
 
+# A fresh Firefox profile fires first-run network/telemetry/update chatter —
+# different noise every launch. These prefs silence it so every run measures
+# the workload, not the onboarding.
+ff_quiet_profile() { # profile-dir
+  cat >"$1/user.js" <<'JS'
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("app.normandy.enabled", false);
+user_pref("app.update.auto", false);
+user_pref("network.captive-portal-service.enabled", false);
+JS
+}
+
+# ---------------------------------------------------------------- W6 browse
+# Real BROWSING in Firefox (Jack's request): local self-driving pages — text,
+# images, JS — that smooth-scroll to the bottom, pause as if reading, then
+# navigate to the next page in the chain, looping. Identical bytes for every
+# variant and zero network, so power deltas are the topology's doing. Runs
+# per topology visit (including the A brackets), giving browsing W the same
+# baseline-bracket treatment as idle W.
+w6_run() { # variant block
+  local name=$1 block=$2 bpid spid
+  local prof="$OUT/prof-browse-$name-$VISIT"
+  mkdir -p "$prof"
+  ff_quiet_profile "$prof"
+  MOZ_DRM_DEVICE=/dev/dri/by-path/pci-0000:00:02.0-render \
+    firefox --profile "$prof" --new-instance --no-remote \
+    "file://$BROWSE_DIR/page0.html" >/dev/null 2>&1 &
+  bpid=$!
+  LOAD_PIDS+=("$bpid")
+  sleep 25 # launch + first page settled
+  (
+    while sample_row "$name" "$block" w6; do sleep 2; done
+  ) &
+  spid=$!
+  LOAD_PIDS+=("$spid")
+  event "$name" "$block" w6_start
+  sleep 150
+  event "$name" "$block" w6_end
+  kill "$spid" "$bpid" 2>/dev/null
+  pkill -f "$prof" 2>/dev/null
+  wait "$spid" 2>/dev/null
+  LOAD_PIDS=()
+  sleep 8
+  [[ $(<"$B/status") == Discharging ]] || {
+    log "ABORT: AC plugged during $name w6"
+    return 1
+  }
+}
+
+# ------------------------------------------------------------- W4/W5 browser
+# The real "watching YouTube" measurement: a browser playing the same local
+# video, hw decode ON vs forced-OFF — the delta is what the browser config
+# work is worth. A background probe records the media engine's actual
+# frequency: nonzero = hardware decode really engaged (not just configured).
+browser_run() { # variant block browser(chromium|firefox) decode(hw|sw)
+  local name=$1 block=$2 br=$3 dec=$4 ph="${br:0:2}${dec}" bpid spid gpid
+  local prof="$OUT/prof-$br-$dec"
+  mkdir -p "$prof"
+  case $br in
+  chromium)
+    local extra=()
+    [[ $dec == sw ]] && extra=(--disable-accelerated-video-decode)
+    chromium --user-data-dir="$prof" --no-first-run --disable-sync \
+      --autoplay-policy=no-user-gesture-required "${extra[@]}" \
+      --new-window "file://$VIDEO_HTML" >/dev/null 2>&1 &
+    bpid=$!
+    ;;
+  firefox)
+    # FF >= 137 hw-decodes BY DEFAULT, so hw = quiet profile; the sw run
+    # force-disables it — the delta is what hardware decode is worth.
+    ff_quiet_profile "$prof"
+    if [[ $dec == sw ]]; then
+      {
+        echo 'user_pref("media.hardware-video-decoding.enabled", false);'
+        echo 'user_pref("media.hardware-video-decoding.force-enabled", false);'
+      } >>"$prof/user.js"
+    fi
+    MOZ_DRM_DEVICE=/dev/dri/by-path/pci-0000:00:02.0-render \
+      firefox --profile "$prof" --new-instance --no-remote \
+      "file://$VIDEO_HTML" >/dev/null 2>&1 &
+    bpid=$!
+    ;;
+  esac
+  LOAD_PIDS+=("$bpid")
+  sleep 30 # browser start + autoplay + pipeline settle
+  (
+    while sample_row "$name" "$block" "$ph"; do sleep 2; done
+  ) &
+  spid=$!
+  LOAD_PIDS+=("$spid")
+  (
+    for _ in $(seq 30); do
+      echo "$name,$block,${ph}_gt1_mhz,$(cat "$GT1_ACT" 2>/dev/null || echo -1)"
+      sleep 5
+    done >>"$BENCH_CSV"
+  ) &
+  gpid=$!
+  LOAD_PIDS+=("$gpid")
+  event "$name" "$block" "${ph}_start"
+  sleep 150
+  event "$name" "$block" "${ph}_end"
+  kill "$spid" "$gpid" "$bpid" 2>/dev/null
+  # browsers spawn process trees a single kill misses — sweep by profile dir
+  pkill -f "$prof" 2>/dev/null
+  wait "$spid" "$gpid" 2>/dev/null
+  LOAD_PIDS=()
+  sleep 10 # let the browser exit fully before the next launch
+  [[ $(<"$B/status") == Discharging ]] || {
+    log "ABORT: AC plugged during $name $ph"
+    return 1
+  }
+}
+
 # ------------------------------------------------------------------- smoke
 run_smoke() {
   note "== SMOKE: apply/assert/revert every variant (no measurement)"
@@ -661,7 +783,12 @@ if w1:
 # ---- W2/W3 per-phase power: fixed work (w2) / fixed rate (w3), so median W
 # over the window compares fairly across variants; delta vs A's same phase.
 for ph, label in (("w2", "W2 bursty-interactive (fixed chunk each 5s)"),
-                  ("w3", "W3 hw-decoded 1080p30 playback (the YouTube proxy)")):
+                  ("w3", "W3 mpv hw-decoded 1080p30 playback"),
+                  ("w6", "W6 Firefox browsing (local pages: load, scroll, images, JS)"),
+                  ("chhw", "W4 Chromium playing 1080p30, hw decode"),
+                  ("chsw", "W4 Chromium playing 1080p30, SW decode (before-state)"),
+                  ("fihw", "W5 Firefox playing 1080p30, hw decode (FF default)"),
+                  ("fisw", "W5 Firefox playing 1080p30, forced SW decode")):
     per = {}
     for x in S:
         if x["phase"] == ph and x["status"] == "Discharging":
@@ -684,7 +811,8 @@ def pct(xs, p):
     return xs[min(len(xs) - 1, int(len(xs) * p))]
 benches = ["exec_ms", "pyspawn_ms", "st_chunk_ms", "hypr_ms", "wake_p50_us", "wake_p99_us"]
 # media-tier extras (already percentiles/counts — shown as single medians)
-for extra in ("w2_chunk_p50_ms", "w2_chunk_p95_ms", "w3_vo_drops", "w3_dec_drops"):
+for extra in ("w2_chunk_p50_ms", "w2_chunk_p95_ms", "w3_vo_drops", "w3_dec_drops",
+              "chhw_gt1_mhz", "chsw_gt1_mhz", "fihw_gt1_mhz", "fisw_gt1_mhz"):
     if any(b == extra for _, b in BR): benches.append(extra)
 variants = sorted({v for v, _ in BR})
 if BR:
@@ -696,7 +824,7 @@ if BR:
         for b in benches:
             xs = BR.get((var, b), [])
             if not xs: cells.append("-"); continue
-            if b.startswith(("wake", "w2", "w3")):
+            if b.startswith(("wake", "w2", "w3", "ch", "fi")):
                 P[(var, b)] = med(xs); cells.append("%.0f" % med(xs))
             else:
                 P[(var, b)] = pct(xs, 0.95)
@@ -800,7 +928,8 @@ cleanup() {
   [[ -n $INIT_BRIGHTNESS ]] &&
     brightnessctl -d intel_backlight set "$INIT_BRIGHTNESS" >/dev/null 2>&1
   [[ -n $SUDO_KEEPALIVE ]] && kill "$SUDO_KEEPALIVE" 2>/dev/null
-  rm -f "$WORK_FILE" "$WORK_FILE.pool" "$VIDEO_FILE" "$OUT/mpv-ipc.sock"
+  rm -f "$WORK_FILE" "$WORK_FILE.pool" "$VIDEO_FILE" "$VIDEO_HTML" "$OUT/mpv-ipc.sock"
+  rm -rf "$BROWSE_DIR"
   notify-send -u normal "A/B power test finished" \
     "Settings restored. Results: $OUT/summary.md" 2>/dev/null
   echo "restored; results in $OUT"
@@ -869,6 +998,56 @@ if [[ $TIER == media ]]; then
     note "ABORT: ffmpeg could not generate $VIDEO_FILE"
     exit 1
   fi
+  cat >"$VIDEO_HTML" <<HTML
+<!doctype html><title>sps-ab</title>
+<body style="margin:0;background:#000">
+<video autoplay loop muted playsinline src="file://$VIDEO_FILE"
+       style="width:100vw;height:100vh;object-fit:contain"></video>
+HTML
+  # deterministic browse chain: 8 pages x ~150KB text + inline SVG images + JS
+  note "generating browse pages"
+  mkdir -p "$BROWSE_DIR"
+  python3 - "$BROWSE_DIR" <<'PY'
+import random, sys
+out = sys.argv[1]
+random.seed(7)  # SAME bytes on every generation — comparable across runs
+words = ("power efficiency measurement laptop battery core island race idle "
+         "scheduler browser render compositor frame decode media engine test "
+         "variant baseline topology watt joule latency scroll page load").split()
+def para():
+    return " ".join(random.choice(words) for _ in range(random.randint(40, 90)))
+def svg(i):
+    r = random.Random(i)
+    rects = "".join(
+        f'<rect x="{r.randint(0,560)}" y="{r.randint(0,140)}" width="{r.randint(20,120)}" '
+        f'height="{r.randint(20,80)}" fill="hsl({r.randint(0,359)},60%,55%)"/>'
+        for _ in range(24))
+    return f'<svg viewBox="0 0 640 200" style="width:100%;height:auto">{rects}</svg>'
+N = 8
+for i in range(N):
+    nxt = (i + 1) % N
+    body = "".join(
+        f"<h2>Section {j}</h2>{svg(i*37+j)}<p>{para()}</p><p>{para()}</p>"
+        for j in range(28))
+    html = f"""<!doctype html><title>sps-ab browse {i}</title>
+<meta charset="utf-8">
+<body style="max-width:52rem;margin:0 auto;font:16px/1.6 sans-serif;padding:1rem">
+<h1>Page {i}</h1>{body}
+<script>
+// self-driving reader: smooth-scroll to the bottom, pause, next page
+let y = 0;
+const step = () => {{
+  y += 120; window.scrollTo({{top: y, behavior: "smooth"}});
+  if (y < document.body.scrollHeight - innerHeight)
+    setTimeout(step, 300);
+  else
+    setTimeout(() => location.replace("page{nxt}.html"), 8000);
+}};
+setTimeout(step, 3000);
+</script>"""
+    open(f"{out}/page{i}.html", "w").write(html)
+print("browse pages ready")
+PY
 fi
 
 if [[ $TIER != media ]]; then
@@ -910,7 +1089,7 @@ echo "w1_size_mb=$W1_MB xz_8mb_s=$(awk -v a="$T0" -v b="$T1" 'BEGIN{printf "%.1f
 fi # TIER != media
 
 EST=$((BLOCKS * (2 + ${#IDLE_VARIANTS[@]}) * 4 + ${#W1_VARIANTS[@]} * 5))
-[[ $TIER == media ]] && EST=$(((2 + ${#IDLE_VARIANTS[@]}) * 10))
+[[ $TIER == media ]] && EST=$(((2 + ${#IDLE_VARIANTS[@]}) * 13 + 16)) # idle+bench+w2+w3+w6 per visit, + browser hw/sw phase
 # -u normal, NOT critical: mako pins critical notifications until dismissed —
 # a popup that vanishes at an unknown time mid-run would change what PSR sees.
 notify-send -u normal -t 15000 "A/B power test started (~${EST} min)" \
@@ -939,12 +1118,23 @@ for ((blk = 1; blk <= BLOCKS; blk++)); do
       bench "$CUR" "$blk"
       w2_run "$CUR" "$blk" || kill_run "w2 aborted for ${v%%|*}"
       w3_run "$CUR" "$blk" || kill_run "w3 aborted for ${v%%|*}"
+      w6_run "$CUR" "$blk" || kill_run "w6 aborted for ${v%%|*}"
     else
       sample_loop "$CUR" "$blk" idle 60 || kill_run "AC during idle visit"
       bench "$CUR" "$blk"
     fi
   done
 done
+
+if [[ $TIER == media ]]; then
+  log "browser phase (on shipped default D): hw vs sw decode, both browsers"
+  apply_variant "$V_D" || kill_run "apply failed for D (browser phase)"
+  snapshot_meta "browser D"
+  for spec in chromium:hw chromium:sw firefox:hw firefox:sw; do
+    browser_run "D" 1 "${spec%%:*}" "${spec##*:}" ||
+      kill_run "browser run aborted (${spec})"
+  done
+fi
 
 log "W1 phase"
 mapfile -t w1shuffled < <(printf '%s\n' "${W1_VARIANTS[@]}" | shuf)
