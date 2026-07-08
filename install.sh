@@ -48,6 +48,19 @@ echo "installed $BIN/omarchy-super-power-saver{,-setup}"
 install -D -m 644 "$HERE/config/51-browser-igpu.conf"   "$HOME/.config/environment.d/51-browser-igpu.conf"
 echo "installed ~/.config/environment.d/51-browser-igpu.conf (MOZ_DRM_DEVICE -> iGPU; active next login)"
 
+# Browser launch flags (battery-verified against Chromium 148 source): only
+# replace a file that is ours or absent — never clobber user customizations.
+for f in chromium-flags.conf electron-flags.conf; do
+  dst="$HOME/.config/$f"
+  if [[ ! -f $dst ]] || grep -q omarchy-super-power-saver "$dst"; then
+    install -m 644 "$HERE/config/$f" "$dst"
+    echo "installed ~/.config/$f"
+  else
+    echo "NOTE: ~/.config/$f exists with your own content — left untouched."
+    echo "      Compare with $HERE/config/$f (148-verified: decode flags are default now)."
+  fi
+done
+
 # Power menu extension: only install fresh; never clobber user customizations.
 if [[ -f $EXT/menu.sh ]]; then
   if grep -q 'Super Power Saver' "$EXT/menu.sh"; then

@@ -1030,6 +1030,16 @@ else
   echo "NOTE: firefox-policies.json not found next to the repo — skipped browser policies."
 fi
 
+# --------------------------------------------- browser battery (Chromium)
+# Memory Saver via managed policy: discards long-inactive background tabs.
+# Its own file under policies/managed/ — composes with any other policies.
+CR_POLICY_SRC=$(dirname "$(readlink -f "$0")")/../config/chromium-policy.json
+[[ -f $CR_POLICY_SRC ]] || CR_POLICY_SRC="$USER_HOME/omarchy-super-power-saver/config/chromium-policy.json"
+if [[ -f $CR_POLICY_SRC ]]; then
+  install -D -m 644 "$CR_POLICY_SRC" /etc/chromium/policies/managed/omarchy-super-power-saver.json
+  echo "installed /etc/chromium/policies/managed/omarchy-super-power-saver.json (Memory Saver)"
+fi
+
 # ------------------------------------------------------- verification tooling
 pacman -S --needed --noconfirm intel-gpu-tools libva-utils nvme-cli linux-tools >/dev/null &&
   echo "installed verification tooling (intel-gpu-tools libva-utils nvme-cli linux-tools)" ||

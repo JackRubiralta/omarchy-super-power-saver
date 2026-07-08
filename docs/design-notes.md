@@ -459,3 +459,41 @@ by Jack's stated rule ("least-power variant that feels smooth, ~0.2–0.5 W
 cost acceptable"): **D**, shipped as PIN_CPUS="0,14-15" (IRQ mask c001).
 C remains one conf line away; E (E-core pair) and the teo/PL1 sweeps remain
 unmeasured — run the thorough tier if D still feels laggy.
+
+### Browser battery config (2026-07-08, source-verified for Chromium 148 + Firefox 151)
+
+Research verdict: **both browsers already hardware-decode video by default on
+this stack** — the classic advice is stale in both directions. Firefox
+removed `media.ffmpeg.vaapi.enabled` in 137 (master switch is
+`media.hardware-video-decoding.enabled`, default true, Intel not
+blocklisted); Chromium's `AcceleratedVideoDecodeLinuxGL` + `ZeroCopyGL` are
+default-on since M143. Battery Saver does not function on desktop Linux
+(no battery-level provider in base/power_monitor) — Memory Saver does.
+
+What we ship instead (config/ + installers):
+- `chromium-flags.conf`: cleaned to the two features still off-by-default
+  and useful — `WebRtcPipeWireCamera` (camera portal) and
+  `AcceleratedVideoEncoder` (hw encode for calls; remove if colors break —
+  intel-media-driver encode bugs exist on adjacent platforms).
+- `chromium-policy.json` → /etc/chromium/policies/managed/ (own file,
+  composes): Memory Saver on, max savings.
+- `electron-flags.conf`: decode features listed EXPLICITLY — Electron majors
+  bundle older Chromium where zero-copy is still off.
+- `firefox-policies.json` → /etc/firefox/policies (non-clobbering):
+  sessionstore 15s→60s, captive-portal probes off, telemetry off; default
+  branch, so user about:config wins.
+- `51-browser-igpu.conf` → environment.d: `MOZ_DRM_DEVICE` pinned to the
+  Intel iGPU BY PATH. **This machine's render nodes are inverted (NVIDIA =
+  renderD128, Intel = renderD129)** and numbering may flip across boots — a
+  numeric device pick can wake the dGPU (~9.9W).
+- Media tier W6: real Firefox browsing per topology variant — deterministic
+  local page chain (text/SVG/JS, auto-scroll, navigate; zero network),
+  baseline-bracketed like idle; W4/W5 measure hw-vs-forced-sw decode in both
+  browsers with a gt1 media-engine frequency probe proving engagement.
+
+Verify decode engagement: Firefox `MOZ_LOG=PlatformDecoderModule:5` (look
+for InitVAAPIDecoder / "VA-API frame"); Chromium DevTools Media domain
+(`kIsPlatformVideoDecoder=true`) or `--vmodule=*vaapi*=2`; both cross-checked
+by gt1 rc6/act-freq during playback. Expected magnitude (published analogs):
+2-5W during 1080p video, larger under the 10W PL1 where software VP9 would
+eat the whole CPU budget.

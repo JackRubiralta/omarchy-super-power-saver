@@ -1,0 +1,5 @@
+{
+  "_comment": "omarchy-super-power-saver: Memory Saver ON machine-wide (works on Linux, unlike Battery Saver). Discards long-inactive background tabs - the biggest real Chromium battery/memory lever. Tabs reload on click. Installed as its own file under /etc/chromium/policies/managed/ so it never touches other policies.",
+  "HighEfficiencyModeEnabled": true,
+  "MemorySaverModeSavings": 2
+}
