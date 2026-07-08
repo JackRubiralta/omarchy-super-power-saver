@@ -64,7 +64,12 @@ done
 # Power menu extension: only install fresh; never clobber user customizations.
 if [[ -f $EXT/menu.sh ]]; then
   if grep -q 'Super Power Saver' "$EXT/menu.sh"; then
-    echo "menu extension already present — left untouched ($EXT/menu.sh)"
+    if cmp -s "$HERE/config/menu.sh" "$EXT/menu.sh"; then
+      echo "menu extension already current ($EXT/menu.sh)"
+    else
+      echo "menu extension present but differs from the shipped version — left untouched"
+      echo "      (diff \"$HERE/config/menu.sh\" \"$EXT/menu.sh\" to review)"
+    fi
   else
     install -m 644 "$HERE/config/menu.sh" "$EXT/menu.sh.super-power-saver"
     echo "NOTE: $EXT/menu.sh exists with your own overrides."

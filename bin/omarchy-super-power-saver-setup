@@ -221,7 +221,7 @@ fi
 # offline set (including 14-15) — revert to shipped defaults instead.
 if ! _online_exp=$(expand_cpulist "$ONLINE_CPUS"); then
   conf_err "internal: ONLINE_CPUS='$ONLINE_CPUS' unparseable — shipped defaults"
-  ONLINE_CPUS="0,14-15" PIN_CPUS="14-15" IRQ_STEER=1
+  ONLINE_CPUS="0,14-15" PIN_CPUS="0,14-15" IRQ_STEER=1
   _online_exp=$(expand_cpulist "$ONLINE_CPUS")
 fi
 OFFLINE_CPUS=""
@@ -1038,6 +1038,8 @@ CR_POLICY_SRC=$(dirname "$(readlink -f "$0")")/../config/chromium-policy.json
 if [[ -f $CR_POLICY_SRC ]]; then
   install -D -m 644 "$CR_POLICY_SRC" /etc/chromium/policies/managed/omarchy-super-power-saver.json
   echo "installed /etc/chromium/policies/managed/omarchy-super-power-saver.json (Memory Saver)"
+else
+  echo "NOTE: chromium-policy.json not found next to the repo — skipped Chromium policy."
 fi
 
 # ------------------------------------------------------- verification tooling

@@ -497,3 +497,44 @@ for InitVAAPIDecoder / "VA-API frame"); Chromium DevTools Media domain
 by gt1 rc6/act-freq during playback. Expected magnitude (published analogs):
 2-5W during 1080p video, larger under the 10W PL1 where software VP9 would
 eat the whole CPU budget.
+
+### v4.2.1 (2026-07-08) — 54-agent adversarial review, 22 confirmed findings fixed
+
+Six dimension-focused finders + two independent refuters per finding over the
+harness/helper/installers. Deduplicated fixes:
+
+1. Smoke's malformed-conf assert expected the pre-2026-07-08 pin (14-15) —
+   every smoke run would have FAILed deterministically against a correct
+   install (found 4x independently).
+2. mpv-death during w3 wrote empty bench values -> analyze crashed at
+   float(''), killing the report for the entire unattended run (and every
+   later analyze of that outdir). Sentinel -1,-1 + try/except.
+3. No workload liveness checks: a browser/mpv that died after launch recorded
+   150s of idle mislabeled as the workload. Now: per-tier command -v preflight
+   + kill -0 after settle AND before the _end event in w3/w6/browser runs.
+4. apply_variant never verified PL1, so a helper ignoring SPS_PL1_UW would
+   have measured the G8/G6 sweep as three identical copies of D. PL1 readback
+   asserted from the fragment.
+5. G8/G6 have no idle visits: their W1 integration window was biased long vs
+   variants with a detected idle-return. They now borrow D's idle baseline
+   (same topology).
+6. sudo keepalive didn't die with the script on SIGKILL — kill -0 $$ added
+   (RAPL sampler already had it).
+7. One transient EC "Unknown" status read aborted a 3h run — plug events now
+   debounced (1s re-read).
+8. GT1_ACT hardcoded card0; card numbers can flip (NVIDIA already claimed
+   renderD128) — derived from the by-path PCI symlink.
+9. Lag budget PASSed on missing/zero bench data — now INCOMPLETE.
+10. Aborted (short) idle visits anchored deltas at full confidence — visits
+    under 20 samples excluded with a WARN.
+11. Helper's ONLINE_CPUS-unparseable fallback pinned the STALE default 14-15.
+12. Scope test: root-owned-600 conf is applied by the helper but unreadable
+    by the test — now aborts with a chmod hint instead of asserting shipped
+    defaults against a conf-shaped system; RAPL leak check additionally hunts
+    the exact conf-driven cap values, not just the stock floors.
+13. set -u runtime crash in the new preflight (${#arr[@]:-0} is a bad
+    substitution; smoke tier hit it) — arrays now default-declared per tier.
+
+Also: chromium policy skip now visible, menu-extension staleness noted by
+install.sh. Two findings refuted (exec-redirect/cleanup interaction and
+SUDO_USER-unset derivation were fine as written).

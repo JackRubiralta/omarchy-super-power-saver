@@ -75,7 +75,10 @@ VIDEO_HTML=/tmp/sps-ab-video.html
 BROWSE_DIR=/tmp/sps-ab-browse
 # gt1 is the iGPU MEDIA engine: sustained nonzero actual frequency during
 # playback = hardware decode engaged; 0 = software decode on the CPU.
-GT1_ACT=/sys/class/drm/card0/gt/gt1/rps_act_freq_mhz
+# Card derived from the stable PCI path — card NUMBERS can flip across boots
+# on this machine (the NVIDIA card has claimed renderD128 already).
+IGPU_CARD=$(basename "$(readlink -f /dev/dri/by-path/pci-0000:00:02.0-card 2>/dev/null)" 2>/dev/null)
+GT1_ACT=/sys/class/drm/${IGPU_CARD:-card0}/gt/gt1/rps_act_freq_mhz
 
 # Timers that could fire mid-run and contaminate exactly one variant's window;
 # active ones are stopped for the whole run (fairness: super pauses snapper
@@ -97,6 +100,11 @@ V_G8="G8|super|SPS_PL1_UW=8000000" # D topology, PL1 10W->8W (load-only: PL1 is 
 V_G6="G6|super|SPS_PL1_UW=6000000" # D topology, PL1 6W
 V_BAL="BAL|stock|balanced"
 V_PERF="PERF|stock|performance"
+
+# Defaults so every tier (incl. smoke/analyze paths) has the arrays declared
+# under set -u; the case below overrides per tier.
+IDLE_VARIANTS=() REALUSE_VARIANTS=() W1_VARIANTS=()
+BROWSER_PHASE=0 IDLE_BLOCKS=0 SOC_FLOOR=40
 
 # Per-tier phases:
 #   IDLE_BLOCKS x [A, shuffled IDLE_VARIANTS, A]  — idle W + responsiveness
@@ -204,13 +212,29 @@ chk() { # condition-result description
 
 VISIT=0 # global visit counter (distinguishes the two A visits per block)
 
+# One transient EC/ACPI status hiccup must not kill an unrepeatable 3h run:
+# a plug event is only real if it persists across a 1s re-read.
+discharging() {
+  [[ $(<"$B/status") == Discharging ]] && return 0
+  sleep 1
+  [[ $(<"$B/status") == Discharging ]]
+}
+
+# A workload that died during its window means the samples are mislabeled
+# idle — worse than no measurement. Checked after settle and before _end.
+alive_or_fail() { # pid name
+  kill -0 "$1" 2>/dev/null && return 0
+  log "ABORT: $2 workload process died mid-run"
+  return 1
+}
+
 sample_row() { # variant block phase -> exit 1 if AC plugged
   local v i st cap dg w
   v=$(<"$B/voltage_now") i=$(<"$B/current_now") st=$(<"$B/status") cap=$(<"$B/capacity")
   dg=$(<"$DGPU/power/runtime_status")
   w=$(awk -v v="$v" -v i="$i" 'BEGIN{printf "%.3f", (v<0?-v:v)*(i<0?-i:i)/1e12}')
   echo "$1,$2,$VISIT,$3,$(date +%s.%N),$v,$i,$w,$cap,$st,$dg" >>"$CSV"
-  [[ $st == Discharging ]]
+  [[ $st == Discharging ]] || discharging
 }
 
 sample_loop() { # variant block phase count
@@ -299,6 +323,19 @@ apply_variant() { # "name|kind|conf" -> sets CUR (name); returns 1 on failure
     }
     grep -q '^root_applied=yes' "$STATE_FILE" || {
       log "ABORT: $name root_applied != yes"
+      return 1
+    }
+    # PL1 must match the fragment too (the G8/G6 sweep variants share D's
+    # topology — without this, a helper ignoring SPS_PL1_UW measures three
+    # identical copies labeled D/G8/G6). File is world-readable.
+    local exp_pl1=10000000 kv
+    local IFS=';'
+    for kv in $conf; do
+      [[ $kv == SPS_PL1_UW=* && ${kv#*=} =~ ^[0-9]+$ ]] && exp_pl1=${kv#*=}
+    done
+    unset IFS
+    [[ $(cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw 2>/dev/null) == "$exp_pl1" ]] || {
+      log "ABORT: $name PL1=$(cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw 2>/dev/null) expected=$exp_pl1"
       return 1
     }
   fi
@@ -407,7 +444,7 @@ w1_run() { # variant block — fixed work: xz the tmpfs file, sample through tai
   # Only the background sampler sees an AC plug (its loop just stops) — the
   # foreground must check too, or the remaining W1 variants integrate wall
   # power into "battery joules" without complaint.
-  [[ $(<"$B/status") == Discharging ]] || {
+  discharging || {
     log "ABORT: AC plugged during/after $name w1"
     return 1
   }
@@ -448,7 +485,7 @@ PY
   kill "$spid" 2>/dev/null
   wait "$spid" 2>/dev/null
   LOAD_PIDS=()
-  [[ $(<"$B/status") == Discharging ]] || {
+  discharging || {
     log "ABORT: AC plugged during $name w2"
     return 1
   }
@@ -465,6 +502,7 @@ w3_run() { # variant block
   mpid=$!
   LOAD_PIDS+=("$mpid")
   sleep 20 # decoder pipeline + renderer settle before measuring
+  alive_or_fail "$mpid" "$name w3(mpv)" || { LOAD_PIDS=(); return 1; }
   (
     while sample_row "$name" "$block" w3; do sleep 2; done
   ) &
@@ -472,6 +510,7 @@ w3_run() { # variant block
   LOAD_PIDS+=("$spid")
   event "$name" "$block" w3_start
   sleep 150
+  alive_or_fail "$mpid" "$name w3(mpv)" || { kill "$spid" 2>/dev/null; LOAD_PIDS=(); return 1; }
   event "$name" "$block" w3_end
   drops=$(python3 - "$OUT/mpv-ipc.sock" <<'PY' 2>/dev/null
 import json, socket, sys
@@ -492,13 +531,17 @@ def q(prop):
 print(f"{q('frame-drop-count')},{q('decoder-frame-drop-count')}")
 PY
   )
+  # empty when the IPC query failed outright (mpv dead): keep the -1 sentinel
+  # q() uses, or analyze would hit float('') and lose the whole report
+  drops=${drops:--1,-1}
+  [[ $drops == *,* ]] || drops="$drops,-1"
   echo "$name,$block,w3_vo_drops,${drops%%,*}" >>"$BENCH_CSV"
   echo "$name,$block,w3_dec_drops,${drops##*,}" >>"$BENCH_CSV"
   kill "$spid" "$mpid" 2>/dev/null
   wait "$spid" "$mpid" 2>/dev/null
   LOAD_PIDS=()
   rm -f "$OUT/mpv-ipc.sock"
-  [[ $(<"$B/status") == Discharging ]] || {
+  discharging || {
     log "ABORT: AC plugged during $name w3"
     return 1
   }
@@ -538,6 +581,7 @@ w6_run() { # variant block
   bpid=$!
   LOAD_PIDS+=("$bpid")
   sleep 25 # launch + first page settled
+  alive_or_fail "$bpid" "$name w6(firefox)" || { LOAD_PIDS=(); return 1; }
   (
     while sample_row "$name" "$block" w6; do sleep 2; done
   ) &
@@ -545,13 +589,19 @@ w6_run() { # variant block
   LOAD_PIDS+=("$spid")
   event "$name" "$block" w6_start
   sleep 150
+  alive_or_fail "$bpid" "$name w6(firefox)" || {
+    kill "$spid" 2>/dev/null
+    pkill -f "$prof" 2>/dev/null
+    LOAD_PIDS=()
+    return 1
+  }
   event "$name" "$block" w6_end
   kill "$spid" "$bpid" 2>/dev/null
   pkill -f "$prof" 2>/dev/null
   wait "$spid" 2>/dev/null
   LOAD_PIDS=()
   sleep 8
-  [[ $(<"$B/status") == Discharging ]] || {
+  discharging || {
     log "ABORT: AC plugged during $name w6"
     return 1
   }
@@ -593,6 +643,7 @@ browser_run() { # variant block browser(chromium|firefox) decode(hw|sw)
   esac
   LOAD_PIDS+=("$bpid")
   sleep 30 # browser start + autoplay + pipeline settle
+  alive_or_fail "$bpid" "$name $ph($br)" || { LOAD_PIDS=(); return 1; }
   (
     while sample_row "$name" "$block" "$ph"; do sleep 2; done
   ) &
@@ -608,6 +659,12 @@ browser_run() { # variant block browser(chromium|firefox) decode(hw|sw)
   LOAD_PIDS+=("$gpid")
   event "$name" "$block" "${ph}_start"
   sleep 150
+  alive_or_fail "$bpid" "$name $ph($br)" || {
+    kill "$spid" "$gpid" 2>/dev/null
+    pkill -f "$prof" 2>/dev/null
+    LOAD_PIDS=()
+    return 1
+  }
   event "$name" "$block" "${ph}_end"
   kill "$spid" "$gpid" "$bpid" 2>/dev/null
   # browsers spawn process trees a single kill misses — sweep by profile dir
@@ -615,7 +672,7 @@ browser_run() { # variant block browser(chromium|firefox) decode(hw|sw)
   wait "$spid" "$gpid" 2>/dev/null
   LOAD_PIDS=()
   sleep 10 # let the browser exit fully before the next launch
-  [[ $(<"$B/status") == Discharging ]] || {
+  discharging || {
     log "ABORT: AC plugged during $name $ph"
     return 1
   }
@@ -666,8 +723,8 @@ run_smoke() {
   "$SPS" on >/dev/null 2>&1
   chk "$([[ $(cat /sys/devices/system/cpu/online) == 0,14-15 ]]; echo $?)" \
     "bad conf -> default online 0,14-15 (got $(cat /sys/devices/system/cpu/online))"
-  chk "$([[ $(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null) == 14-15 ]]; echo $?)" \
-    "bad conf -> default pin 14-15"
+  chk "$([[ $(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null) == 0,14-15 ]]; echo $?)" \
+    "bad conf -> default pin 0,14-15 (got '$(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null)')"
   chk "$(sudo -n grep -q 'bad SPS_ONLINE_CPUS' /run/omarchy-super-power-saver.drift; echo $?)" \
     "bad conf -> drift log has rejection lines"
   "$SPS" off >/dev/null 2>&1
@@ -729,9 +786,15 @@ for k in sorted(visits):
 
 deltas = {}   # variant -> [delta per block]
 a_noise = []
-for blk in sorted({v["block"] for v in visits.values()}):
-    A = [visits[k] for k in sorted(visits) if visits[k]["block"] == blk and visits[k]["variant"] == "A"]
-    T = [visits[k] for k in sorted(visits) if visits[k]["block"] == blk and visits[k]["variant"] != "A"]
+MIN_VISIT_N = 20  # below this, a visit is ~noise (EC smoothing) — exclude
+short = [k for k in visits if len(visits[k]["w"]) < MIN_VISIT_N]
+for k in short:
+    lines.append("\nWARN: visit %d (%s, block %d) has only %d samples — excluded from deltas"
+                 % (k, visits[k]["variant"], visits[k]["block"], len(visits[k]["w"])))
+usable = {k: v for k, v in visits.items() if k not in short}
+for blk in sorted({v["block"] for v in usable.values()}):
+    A = [usable[k] for k in sorted(usable) if usable[k]["block"] == blk and usable[k]["variant"] == "A"]
+    T = [usable[k] for k in sorted(usable) if usable[k]["block"] == blk and usable[k]["variant"] != "A"]
     if len(A) < 2:
         lines.append("\nWARN: block %d lacks bracketing A visits — deltas skipped" % blk)
         continue
@@ -775,8 +838,12 @@ w1 = []
 for (var, blk), ev in sorted(EV.items()):
     if "w1_start" not in ev or "w1_end" not in ev: continue
     t0, t1 = ev["w1_start"], ev["w1_end"]
-    idle = med([visits[k]["med"] for k in visits if visits[k]["variant"] == var]) if any(
-        visits[k]["variant"] == var for k in visits) else float("nan")
+    # PL1-sweep variants share D's topology but have no idle visits of their
+    # own — without a baseline their integration window would be biased long
+    # (fixed 30s tail) versus everyone else's detected idle-return.
+    base_var = {"G8": "D", "G6": "D"}.get(var, var)
+    idle = med([visits[k]["med"] for k in visits if visits[k]["variant"] == base_var]) if any(
+        visits[k]["variant"] == base_var for k in visits) else float("nan")
     pts = sorted((s["epoch"], s["watts"]) for s in S
                  if s["variant"] == var and s["phase"] == "w1" and int(s["block"]) == blk
                  and s["status"] == "Discharging")
@@ -825,7 +892,10 @@ for ph, label in (("w2", "W2 bursty-interactive (fixed chunk each 5s)"),
 # ---- responsiveness
 BR = {}
 for var, blk, bench, val in rows("bench.csv", 4):
-    BR.setdefault((var, bench), []).append(float(val))
+    try:
+        BR.setdefault((var, bench), []).append(float(val))
+    except ValueError:
+        pass  # a dead-workload sentinel line must not kill the whole report
 def pct(xs, p):
     xs = sorted(xs)
     return xs[min(len(xs) - 1, int(len(xs) * p))]
@@ -856,14 +926,18 @@ if BR:
         for var in variants:
             if var == "A": continue
             checks = []
-            ok = True
+            ok, complete = True, True
             for b, lim in (("pyspawn_ms", 2.0), ("wake_p99_us", 1.5)):
                 a, x = P.get(("A", b)), P.get((var, b))
-                if a and x:
+                if a is not None and x is not None and a > 0:
                     r = x / a
                     checks.append("%s %.1fx" % (b, r))
                     ok &= r <= lim
-            lines.append("- %s: %s -> %s" % (var, ", ".join(checks), "PASS" if ok else "FAIL"))
+                else:
+                    checks.append("%s MISSING" % b)
+                    complete = False
+            verdict = ("PASS" if ok else "FAIL") if complete else "INCOMPLETE"
+            lines.append("- %s: %s -> %s" % (var, ", ".join(checks), verdict))
 
 # ---- recommendation
 lines += ["", "## Recommendation inputs",
@@ -887,6 +961,19 @@ note "== power-mode-ab-test ($TIER) -> $OUT"
 
 [[ $("$SPS" status) == off && ! -f $STATE_FILE && ! -f $RUN_STATE ]] ||
   { note "ABORT: mode must be OFF with no state files ('$SPS' off; retry)"; exit 1; }
+
+# Tools the selected tier will actually invoke — a missing binary must abort
+# NOW, not 40 minutes into an unrepeatable battery window as a dead workload
+# silently mislabeled as measurement.
+NEED="python3 awk"
+((${#W1_VARIANTS[@]})) && NEED+=" xz"
+if ((${#REALUSE_VARIANTS[@]})) || [[ $BROWSER_PHASE == 1 ]]; then
+  NEED+=" ffmpeg mpv firefox"
+fi
+[[ $BROWSER_PHASE == 1 ]] && NEED+=" chromium"
+for tool in $NEED; do
+  command -v "$tool" >/dev/null || { note "ABORT: missing tool: $tool"; exit 1; }
+done
 
 # The installed root helper must understand the topology conf keys, or every
 # super "variant" would silently measure the same shipped default.
@@ -957,7 +1044,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 129' INT TERM
 
-(while sleep 50; do sudo -nv 2>/dev/null || exit; done) &
+(while sleep 50; do kill -0 $$ 2>/dev/null || exit; sudo -nv 2>/dev/null || exit; done) &
 SUDO_KEEPALIVE=$!
 # hypridle listens on Wayland idle-notify (systemd-inhibit can't stop it) and
 # fires the screensaver at 150s idle — mid-run that's a massive power+redraw

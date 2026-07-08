@@ -80,13 +80,23 @@ subset_of() {
 # non-group/other-writable conf. A conf that fails the gate (or that this
 # unprivileged test can't read) must not shape the expectations, or the test
 # asserts a topology the helper never applied.
-conf_trusted() {
-  [[ -f $CONF && -r $CONF && $(stat -c %u "$CONF" 2>/dev/null) == 0 &&
+# helper_trusts = the HELPER will source it (root-owned, no group/other write);
+# the test additionally needs read access to derive matching expectations.
+helper_trusts() {
+  [[ -f $CONF && $(stat -c %u "$CONF" 2>/dev/null) == 0 &&
     -z $(find "$CONF" -maxdepth 0 -perm /022 2>/dev/null) ]]
 }
-if [[ -f $CONF ]] && ! conf_trusted; then
-  echo "NOTE: $CONF exists but is not root-owned 644-or-stricter (or unreadable) —" >&2
-  echo "      the helper ignores it; asserting SHIPPED DEFAULTS. Fix its perms if unintended." >&2
+conf_trusted() { helper_trusts && [[ -r $CONF ]]; }
+if helper_trusts && [[ ! -r $CONF ]]; then
+  # e.g. root:root 600: the helper APPLIES it but this unprivileged test can't
+  # read it — proceeding would assert shipped defaults against a conf-shaped
+  # system and blame the helper for the mismatch.
+  echo "ABORT: $CONF is applied by the helper but unreadable here — chmod 644 it and retry." >&2
+  exit 1
+fi
+if [[ -f $CONF ]] && ! helper_trusts; then
+  echo "NOTE: $CONF exists but is not root-owned/non-group/other-writable — the helper ignores it;" >&2
+  echo "      asserting SHIPPED DEFAULTS. Fix its ownership/perms if unintended." >&2
 fi
 # a stray exported SPS_* in the invoking shell must not masquerade as conf
 unset SPS_ONLINE_CPUS SPS_ALLOWED_CPUS SPS_IRQ_STEER
@@ -109,6 +119,11 @@ if conf_trusted; then
 fi
 EXP_IRQ_CPUS=${EXP_PIN:-$EXP_ONLINE}
 EXP_MASK=$(mask_of_cpulist "$(expand_cpulist "$EXP_IRQ_CPUS")")
+# effective mode caps (conf may lower them) — the post-off leak check must
+# look for THESE values, not just the shipped 10W/15W
+MODE_PL1=10000000 MODE_PL2=15000000
+[[ ${SPS_PL1_UW:-} =~ ^[0-9]+$ && ${SPS_PL1_UW:-0} -gt 0 ]] && MODE_PL1=$SPS_PL1_UW
+[[ ${SPS_PL2_UW:-} =~ ^[0-9]+$ && ${SPS_PL2_UW:-0} -gt 0 ]] && MODE_PL2=$SPS_PL2_UW
 # systemd prints AllowedCPUs as space-separated ranges ("0 14-15"), the
 # kernel's cpuset files use commas ("0,14-15").
 EXP_PIN_SYSTEMD=${EXP_PIN//,/ }
@@ -287,6 +302,10 @@ for z in intel-rapl:0 intel-rapl-mmio:0; do
   [[ $(k "${z}_pl1") -ge 20000000 ]] || fail "post: ${z} PL1=$(k "${z}_pl1") — mode cap leaked"
   [[ $(k "${z}_pl2") -gt 15000000 ]] || fail "post: ${z} PL2=$(k "${z}_pl2") — mode cap leaked"
   [[ $(k "${z}_pl4") -gt 25000000 ]] || fail "post: ${z} PL4=$(k "${z}_pl4") — mode clamp leaked"
+  # a conf-lowered cap could sit above the stock-floor thresholds — the exact
+  # mode values must never survive an off
+  [[ $(k "${z}_pl1") == "$MODE_PL1" ]] && fail "post: ${z} PL1 == mode cap $MODE_PL1 — leaked"
+  [[ $(k "${z}_pl2") == "$MODE_PL2" ]] && fail "post: ${z} PL2 == mode cap $MODE_PL2 — leaked"
 done
 echo "RAPL pre/post (thermald-managed while off, informational):"
 diff --side-by-side "$OUT/pre.volatile" "$OUT/post.volatile" | sed 's/^/  /' || true
