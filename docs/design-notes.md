@@ -189,6 +189,33 @@ Verification tooling:
   UNCHANGED), toggles off, diffs pre vs post — must be byte-identical. Run
   with mode off; don't plug/unplug AC or USB mid-run.
 
+**v4.1 hardening (2026-07-08, 38-agent adversarial review: 29 confirmed / 4
+refuted, all fixed):** the big ones — (1) `off` with a lost user-side state
+file was a no-op while every root knob stayed applied; `off`/the watcher now
+fall back to the root `/run` state (and the watcher hands reconciliation to a
+DETACHED unit — running `off` in its own process would kill itself mid-restore,
+the v3 bug class). (2) No user-side locking: a double-tap toggle could apply
+knobs while status read off; mutating verbs now flock `$STATE_DIR/.lock`.
+(3) Snapshots are atomic + sentinel-validated; a truncated `/run` state is
+never trusted (apply re-saves, restore takes the defaults branch, `on` ABORTS
+if even the snapshot fails — never mutate without a baseline). (4) Every
+restore key now falls back saved → cached default → hardware-derived stock;
+missing keys can no longer mean "leave it applied" (incl. snapper/thermald
+restart, RAPL enabled bits, fp control). (5) Watcher expectations re-observed
+after each successful reassert (conf changes between on/reassert stormed);
+reassert exits 3 on missing state so callers reconcile instead of retrying
+forever. (6) Helper `off` failure keeps the state file + one critical
+notification (silent-rule exception) so retry works. (7) Setup replaces the
+helper via atomic rename (an in-place rewrite corrupts a RUNNING helper
+mid-parse) and refuses to cache "stock" defaults while either half of the mode
+is on. (8) `flock -w 20` + `timeout`/`--no-block` on all systemd/D-Bus calls —
+one wedged call can't silently queue every later on/off. (9) prev-profile
+restore now keyed on AC state unchanged since `on` (was: never restored on
+AC); wifi powersave restored from snapshot, not the AC heuristic. (10) Stale
+(pre-reboot) `off` no longer fires the helper's no-state sledgehammer at a
+freshly-booted stock system; orphaned legacy hypr toggles get cleaned +
+reloaded from every path (on/off/boot-cleanup).
+
 Rejected after research (so nobody re-tries them): PCI runtime-PM sweep for
 the remaining `control=on` devices (verified no-op — those drivers have no
 runtime-suspend callbacks: nvme, ISH, proc_thermal, CNVi wifi), NVMe APST

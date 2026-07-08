@@ -5,6 +5,7 @@
 #   /usr/local/bin/omarchy-super-power-saver-helper  (root-owned sysfs knob script)
 #   /etc/sudoers.d/omarchy-super-power-saver         (NOPASSWD: on|off|reassert|diag)
 #   /etc/udev/rules.d/61-igpu-dev-path.rules         (stable /dev/dri/igpu symlink for AQ_DRM_DEVICES)
+#   /etc/omarchy-super-power-saver.defaults          (stock values for worst-case restore)
 #   verification tooling: intel-gpu-tools libva-utils nvme-cli linux-tools
 #
 # Run:  sudo /home/jack/.local/bin/omarchy-super-power-saver-setup
@@ -20,13 +21,18 @@ fi
 TARGET_USER="${SUDO_USER:-jack}"
 
 # ---------------------------------------------------------------- root helper
-cat >/usr/local/bin/omarchy-super-power-saver-helper <<'HELPER'
+# Written to a temp file in the same directory and atomically renamed over the
+# target: a helper instance that is executing right now keeps its old inode
+# (bash reads scripts incrementally — an in-place rewrite corrupts a running
+# reassert/off mid-parse).
+HELPER_TMP=$(mktemp /usr/local/bin/.omarchy-super-power-saver-helper.XXXXXX)
+cat >"$HELPER_TMP" <<'HELPER'
 #!/bin/bash
 
 # Root half of omarchy-super-power-saver (v4): sysfs power knobs with
 # save/restore. State in /run (tmpfs) — sysfs resets on reboot anyway.
 #
-# v4 changes (2026-07-08, research + design-review driven):
+# v4 design notes (2026-07-08, research + two adversarial review passes):
 #  - LP-E island consolidation: E-cores 6-13 offlined too (P 1-5 already were;
 #    cpu0 is not hotpluggable) and user/system/machine.slice runtime-pinned to
 #    the LP-E cpus 14-15 on the low-power SoC tile via AllowedCPUs, so light
@@ -41,25 +47,24 @@ cat >/usr/local/bin/omarchy-super-power-saver-helper <<'HELPER'
 #  - RAPL PL4 (constraint_2, peak power) clamped to 25W in MSR+MMIO. Never
 #    write 0 to a power limit.
 #  - snd_hda power_save 10s -> 1s; snapper-timeline.timer paused while on.
-#  - w() rejects empty values (cross-version restore wrote blank lines before);
-#    wv() readback-verifies and logs drift to /run for diag. MSR RAPL is the
-#    authoritative drift signal (the Dell EC only rewrites MMIO).
-#  - Optional A/B knobs from /etc/omarchy-super-power-saver.conf (root-owned,
-#    not group/other-writable — it feeds this root shell): SPS_PL1_UW,
-#    SPS_PL2_UW, SPS_CPUIDLE_GOV. Toggle off->on to pick up changes.
-#  - apply() no longer overwrites an existing /run baseline ('on' twice would
-#    have snapshotted already-modified values and restored them as "stock").
+#  - w() rejects empty values; wv() readback-verifies and logs drift to /run
+#    for diag. MSR RAPL is the authoritative drift signal (the Dell EC only
+#    rewrites MMIO).
+#  - Snapshots are ATOMIC and SELF-VALIDATING: save() writes to a temp file,
+#    appends an end sentinel, verifies it, then renames. A v4 state without
+#    the sentinel is a truncated artifact of an interrupted save and is never
+#    trusted — apply() re-saves, restore() takes the defaults branch.
+#  - restore() gives EVERY knob a stock fallback (saved value -> cached
+#    default -> hardware-derived last resort), so a v3-era or partial state
+#    can never silently skip a restore (the no_turbo lesson, generalized).
+#  - All verbs serialize on a /run flock with a 20s timeout (exit 75) —
+#    a wedged D-Bus call must not silently queue every later on/off/reassert;
+#    unit stop/start use --no-block, method calls are wrapped in timeout.
 #  - dGPU (0000:01:00.0/.1) IRQs are never touched — the device is suspended
-#    and fires none (zero benefit), and the never-wake-dGPU constraint stays
-#    airtight. Reading its sysfs irq/msi_irqs files does not wake it.
-#  - All verbs serialize on a /run flock: the v4 reassert takes seconds on the
-#    LP-E cores, and an in-flight reassert racing 'off' would re-pin knobs
-#    after restore. reassert re-checks the state file after acquiring.
-#  - restore() applies unconditional stock resets for every v4 knob on ANY
-#    off (the no_turbo lesson): stock is a verified constant here (AllowedCPUs
-#    empty, IRQs ffff, slpc base, snd 10, governor menu) and nothing else
-#    manages these — so even a version-skewed or lost state file can't leak
-#    LP-E confinement into other modes.
+#    and fires none, and reading its sysfs irq files does not wake it.
+#  - Optional A/B knobs from /etc/omarchy-super-power-saver.conf (root-owned,
+#    not group/other-writable — it feeds this root shell; values validated):
+#    SPS_PL1_UW, SPS_PL2_UW, SPS_CPUIDLE_GOV. Toggle off->on to pick up changes.
 
 set -u
 
@@ -79,6 +84,7 @@ PMC=/sys/kernel/debug/pmc_core
 SND=/sys/module/snd_hda_intel/parameters/power_save
 CPUIDLE=/sys/devices/system/cpu/cpuidle/current_governor
 SNAPPER_TIMER=snapper-timeline.timer
+VERB="${1:-}"
 
 # CPU topology (Core Ultra 9 285H): cpu0-5 = P, cpu6-13 = E, cpu14-15 = LP-E
 # (SoC tile). cpu0 has no online file (not hotpluggable) and stays as kernel/
@@ -95,18 +101,26 @@ PL4=25000000        # 25W peak clamp (stock 205W)
 CPUIDLE_GOV=""      # empty = leave governor alone
 
 # Optional A/B overrides. Only sourced when root-owned and not writable by
-# group/other — this file is executed by a NOPASSWD-sudo root shell.
+# group/other — this file is executed by a NOPASSWD-sudo root shell. Values
+# are validated: only positive integers may reach a power-limit write.
 if [[ -f $CONF && $(stat -c %u "$CONF" 2>/dev/null) == 0 &&
       -z $(find "$CONF" -maxdepth 0 -perm /022 2>/dev/null) ]]; then
   # shellcheck disable=SC1090
   . "$CONF"
-  PL1=${SPS_PL1_UW:-$PL1}
-  PL2=${SPS_PL2_UW:-$PL2}
+  [[ ${SPS_PL1_UW:-} =~ ^[0-9]+$ && ${SPS_PL1_UW:-0} -gt 0 ]] && PL1=$SPS_PL1_UW
+  [[ ${SPS_PL2_UW:-} =~ ^[0-9]+$ && ${SPS_PL2_UW:-0} -gt 0 ]] && PL2=$SPS_PL2_UW
   CPUIDLE_GOV=${SPS_CPUIDLE_GOV:-}
 fi
 
-# Serialize on/off/reassert (see header). Callers must not hold fd 9.
-lock() { exec 9>"$LOCK"; flock 9; }
+# Serialize on/off/reassert/diag. Bounded wait: one wedged call must not make
+# every later invocation hang silently; callers see exit 75 and may retry.
+lock() {
+  exec 9>"$LOCK"
+  flock -w 20 9 || {
+    echo "$(date +%s) lock timeout (verb=$VERB pid=$$)" >>"$DRIFT_LOG"
+    exit 75
+  }
+}
 
 # Write helpers: w() refuses empty values (a missing saved key must be a
 # no-op, not a blank-line write); wv() additionally verifies the readback and
@@ -143,9 +157,11 @@ psr_assert() {
   # 0x2 = I915_PSR_DEBUG_ENABLE. Only write when PSR2 isn't already active —
   # unconditional writes force a PSR exit/re-train cycle every reassert tick.
   if ! grep -qi "PSR2 enabled" "$PSR_STATUS" 2>/dev/null; then
-    if w 2 "$PSR_DEBUG" && ! grep -q '^psr_forced=1' "$RUN_STATE" 2>/dev/null; then
-      echo "psr_forced=1" >>"$RUN_STATE"
-    fi
+    # Record BEFORE mutating: a crash between write and record would leak a
+    # forced PSR with no restore flag. A recorded flag without a successful
+    # write is benign — psr_restore merely writes the stock 0.
+    grep -q '^psr_forced=1' "$RUN_STATE" 2>/dev/null || echo "psr_forced=1" >>"$RUN_STATE"
+    w 2 "$PSR_DEBUG"
   fi
 }
 
@@ -181,6 +197,9 @@ dgpu_irqs() {
 }
 
 save() {
+  # Atomic + self-validating: temp file, end sentinel, verify, rename (same
+  # tmpfs -> rename(2) is atomic). An interrupted save leaves NO state file,
+  # so 'on' re-snapshots cleanly and 'off' takes the defaults branch.
   {
     echo "v=4"
     echo "aspm=$(tr -d '[]' <<<"$(grep -o '\[.*\]' $ASPM 2>/dev/null)")"
@@ -202,11 +221,11 @@ save() {
     done
     echo "snd_power_save=$(cat $SND 2>/dev/null)"
     echo "cpuidle_governor=$(cat $CPUIDLE 2>/dev/null)"
-    echo "snapper_timeline_was_active=$(systemctl is-active $SNAPPER_TIMER 2>/dev/null)"
-    echo "thermald_was_active=$(systemctl is-active thermald.service 2>/dev/null)"
+    echo "snapper_timeline_was_active=$(timeout 25 systemctl is-active $SNAPPER_TIMER 2>/dev/null)"
+    echo "thermald_was_active=$(timeout 25 systemctl is-active thermald.service 2>/dev/null)"
     local s
     for s in $SLICES; do
-      echo "cg_${s%%.*}_allowed=$(systemctl show -p AllowedCPUs --value "$s" 2>/dev/null)"
+      echo "cg_${s%%.*}_allowed=$(timeout 25 systemctl show -p AllowedCPUs --value "$s" 2>/dev/null)"
     done
     local fp
     if fp=$(fp_find); then
@@ -229,10 +248,26 @@ save() {
     for i in /proc/irq/[0-9]*; do
       echo "irq_aff_$(basename "$i")=$(cat "$i/smp_affinity_list" 2>/dev/null)"
     done
-  } >"$RUN_STATE"
+    echo "sps_snapshot_complete=1"
+  } >"$RUN_STATE.tmp"
+  if grep -q '^sps_snapshot_complete=1' "$RUN_STATE.tmp" 2>/dev/null; then
+    mv "$RUN_STATE.tmp" "$RUN_STATE"
+  else
+    rm -f "$RUN_STATE.tmp"
+    return 1
+  fi
 }
 
 get_saved() { grep "^$1=" "$RUN_STATE" 2>/dev/null | cut -d= -f2; }
+
+# A v4 state file without its end sentinel is a truncated artifact of an
+# interrupted save — never trust it (pre-sentinel v3 files have no v=4 line
+# and are handled by the per-key fallbacks instead).
+state_truncated() {
+  [[ -f $RUN_STATE ]] &&
+    grep -q '^v=4' "$RUN_STATE" 2>/dev/null &&
+    ! grep -q '^sps_snapshot_complete=1' "$RUN_STATE" 2>/dev/null
+}
 
 rapl_apply() {
   local zp
@@ -280,29 +315,46 @@ slpc_apply() {
 }
 
 gpu_restore() {
-  # Exact restore of the saved values (legacy gt_* files alias gt0 — restore
-  # the per-GT files first, then the legacy aliases, so gt0 ends at its
-  # legacy-saved value if they ever disagree).
-  local g sm sb sp
+  # Fallback chain per value: saved -> setup-time cached default -> RP0.
+  # Serves both the exact-restore and the no-state paths (get_saved is empty
+  # in the latter). Legacy gt_* files alias gt0 — restore the per-GT files
+  # first, then the legacy aliases, so gt0 ends at its legacy-saved value if
+  # they ever disagree.
+  local g sm sb sp b rp0
   for g in "$GPU"/gt/gt*; do
     [[ -f $g/rps_max_freq_mhz ]] || continue
-    sm=$(get_saved "gt_$(basename "$g")_max")
-    sb=$(get_saved "gt_$(basename "$g")_boost")
-    w "$sm" "$g/rps_max_freq_mhz"
-    w "$sb" "$g/rps_boost_freq_mhz"
+    b=$(basename "$g")
+    rp0=$(cat "$g/rps_RP0_freq_mhz" 2>/dev/null)
+    sm=$(get_saved "gt_${b}_max")
+    sb=$(get_saved "gt_${b}_boost")
+    case $b in
+    gt0)
+      w "${sm:-${DEF_GT0_MAX:-$rp0}}" "$g/rps_max_freq_mhz"
+      w "${sb:-${DEF_GT0_BOOST:-$rp0}}" "$g/rps_boost_freq_mhz"
+      ;;
+    gt1)
+      w "${sm:-${DEF_GT1_MAX:-$rp0}}" "$g/rps_max_freq_mhz"
+      w "${sb:-${DEF_GT1_BOOST:-$rp0}}" "$g/rps_boost_freq_mhz"
+      ;;
+    *)
+      w "${sm:-$rp0}" "$g/rps_max_freq_mhz"
+      w "${sb:-$rp0}" "$g/rps_boost_freq_mhz"
+      ;;
+    esac
     if [[ -f $g/slpc_power_profile ]]; then
-      # Unconditional: saved value, else cached default, else hardware stock.
-      sp=$(get_saved "slpc_$(basename "$g")")
-      case $(basename "$g") in
+      sp=$(get_saved "slpc_$b")
+      case $b in
       gt0) w "${sp:-${DEF_SLPC_GT0:-base}}" "$g/slpc_power_profile" ;;
       gt1) w "${sp:-${DEF_SLPC_GT1:-base}}" "$g/slpc_power_profile" ;;
       *) w "${sp:-base}" "$g/slpc_power_profile" ;;
       esac
     fi
   done
-  sm=$(get_saved gpu_max); sb=$(get_saved gpu_boost)
-  w "$sm" "$GPU/gt_max_freq_mhz"
-  w "$sb" "$GPU/gt_boost_freq_mhz"
+  sm=$(get_saved gpu_max)
+  sb=$(get_saved gpu_boost)
+  rp0=$(cat "$GPU/gt_RP0_freq_mhz" 2>/dev/null)
+  w "${sm:-${DEF_GPU_MAX:-$rp0}}" "$GPU/gt_max_freq_mhz"
+  w "${sb:-${DEF_GPU_BOOST:-$rp0}}" "$GPU/gt_boost_freq_mhz"
 }
 
 cgroup_apply() {
@@ -312,7 +364,7 @@ cgroup_apply() {
   local s
   for s in $SLICES; do
     [[ $(cat "/sys/fs/cgroup/$s/cpuset.cpus" 2>/dev/null) == "$LP_CPUS" ]] ||
-      systemctl set-property --runtime "$s" "AllowedCPUs=$LP_CPUS" 2>/dev/null
+      timeout -k 5 25 systemctl set-property --runtime "$s" "AllowedCPUs=$LP_CPUS" 2>/dev/null
   done
 }
 
@@ -321,20 +373,23 @@ cgroup_restore() {
   # stock AllowedCPUs is empty on this machine, so a missing key naturally
   # resets via the empty assignment; a non-empty saved value (custom user pin)
   # is put back exactly.
-  local s
+  local s dirty=0
   for s in $SLICES; do
-    systemctl set-property --runtime "$s" "AllowedCPUs=$(get_saved "cg_${s%%.*}_allowed")" 2>/dev/null
+    timeout -k 5 25 systemctl set-property --runtime "$s" \
+      "AllowedCPUs=$(get_saved "cg_${s%%.*}_allowed")" 2>/dev/null
   done
-  # Belt-and-braces: if the empty-assignment reset didn't take (semantics
-  # verified at install time, but this is the one failure that would leave the
-  # session pinned to 2 LP cores), drop our runtime drop-ins directly.
-  if [[ -z $(get_saved cg_user_allowed) &&
-        -n $(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null) ]]; then
-    rm -rf /run/systemd/system.control/user.slice.d \
-           /run/systemd/system.control/system.slice.d \
-           /run/systemd/system.control/machine.slice.d 2>/dev/null
-    systemctl daemon-reload
-  fi
+  # Belt-and-braces, scoped PER SLICE: if an empty-assignment reset didn't
+  # take (the one failure that would leave the session pinned to 2 LP cores),
+  # drop only that slice's runtime drop-in — a just-restored custom pin on
+  # another slice must survive.
+  for s in $SLICES; do
+    if [[ -z $(get_saved "cg_${s%%.*}_allowed") &&
+          -n $(cat "/sys/fs/cgroup/$s/cpuset.cpus" 2>/dev/null) ]]; then
+      rm -rf "/run/systemd/system.control/$s.d" 2>/dev/null
+      dirty=1
+    fi
+  done
+  [[ $dirty == 1 ]] && timeout -k 5 25 systemctl daemon-reload
 }
 
 irq_steer() {
@@ -401,13 +456,14 @@ irq_restore() {
 # CPUs are still online) -> IRQ steering (masks already on LP-E when hotplug
 # runs) -> offline. See the design notes in the project doc.
 apply_knobs() {
-  systemctl is-active --quiet thermald.service && systemctl stop thermald.service
+  timeout 25 systemctl is-active --quiet thermald.service &&
+    timeout -k 5 25 systemctl --no-block stop thermald.service 2>/dev/null
 
   # If something (udev/ppd) moved the profile off power-saver, put it back —
   # this also restores EPP=power and EPB=15 via ppd itself.
   if command -v powerprofilesctl >/dev/null &&
-    [[ $(powerprofilesctl get 2>/dev/null) != power-saver ]]; then
-    powerprofilesctl set power-saver 2>/dev/null
+    [[ $(timeout 25 powerprofilesctl get 2>/dev/null) != power-saver ]]; then
+    timeout 25 powerprofilesctl set power-saver 2>/dev/null
   fi
 
   # Dell's true low-power thermal mode (fan down + firmware CPU power cut).
@@ -431,7 +487,8 @@ apply_knobs() {
   [[ -n $fp && -d $fp ]] && w auto "$fp/power/control"
 
   [[ $(cat "$SND" 2>/dev/null) == 1 ]] || w 1 "$SND"
-  systemctl is-active --quiet "$SNAPPER_TIMER" && systemctl stop "$SNAPPER_TIMER"
+  timeout 25 systemctl is-active --quiet "$SNAPPER_TIMER" &&
+    timeout -k 5 25 systemctl --no-block stop "$SNAPPER_TIMER" 2>/dev/null
 
   cgroup_apply
   irq_steer
@@ -452,26 +509,39 @@ apply_knobs() {
 
 apply() {
   lock
-  # Never re-snapshot over an existing baseline: a second 'on' (stray manual
-  # sudo call, user-side state lost while /run state alive) would capture
-  # already-modified values and later "restore" them as stock — permanent
-  # LP-E confinement in all modes.
-  [[ -f $RUN_STATE ]] || save
+  # A truncated snapshot must never become the baseline; with it gone, save()
+  # re-snapshots. If even save() fails (tmpfs full), ABORT without touching a
+  # single knob — applying without a baseline is the one unrecoverable state.
+  state_truncated && rm -f "$RUN_STATE"
+  if [[ ! -f $RUN_STATE ]]; then
+    save || { rm -f "$RUN_STATE" "$RUN_STATE.tmp"; exit 1; }
+  fi
   apply_knobs
 }
 
 restore() {
   lock
 
+  # Truncated v4 snapshot: discard and take the defaults path below — its
+  # per-key fallbacks land every knob on cached/derived stock values.
+  state_truncated && rm -f "$RUN_STATE"
+
   # Stock defaults cached at setup time — the fallback for any knob whose
   # saved key is missing (v3-era state, lost state, version skew). Visible to
-  # the *_restore functions below via bash dynamic scoping.
-  local DEF_RAPL_MSR_PL1="" DEF_RAPL_MSR_TAU="" DEF_RAPL_MSR_PL2="" DEF_RAPL_MSR_PL4=""
-  local DEF_RAPL_MMIO_PL1="" DEF_RAPL_MMIO_TAU="" DEF_RAPL_MMIO_PL2="" DEF_RAPL_MMIO_PL4=""
+  # the *_restore functions via bash dynamic scoping. Guarded like $CONF: this
+  # is a root shell.
+  local DEF_RAPL_MSR_PL1="" DEF_RAPL_MSR_TAU="" DEF_RAPL_MSR_PL2="" DEF_RAPL_MSR_PL4="" DEF_RAPL_MSR_ENABLED=""
+  local DEF_RAPL_MMIO_PL1="" DEF_RAPL_MMIO_TAU="" DEF_RAPL_MMIO_PL2="" DEF_RAPL_MMIO_PL4="" DEF_RAPL_MMIO_ENABLED=""
   local DEF_SND_POWER_SAVE="" DEF_SLPC_GT0="" DEF_SLPC_GT1="" DEF_CPUIDLE_GOV="" DEF_IRQ_DEFAULT_AFF=""
-  if [[ -f $DEFAULTS ]]; then
+  local DEF_ASPM="" DEF_EPB="" DEF_NMI_WATCHDOG="" DEF_DIRTY_WRITEBACK="" DEF_LAPTOP_MODE="" DEF_FP_CONTROL=""
+  local DEF_GPU_MAX="" DEF_GPU_BOOST="" DEF_GT0_MAX="" DEF_GT0_BOOST="" DEF_GT1_MAX="" DEF_GT1_BOOST=""
+  local RESTORE_WARN=""
+  if [[ -f $DEFAULTS && $(stat -c %u "$DEFAULTS" 2>/dev/null) == 0 &&
+        -z $(find "$DEFAULTS" -maxdepth 0 -perm /022 2>/dev/null) ]]; then
     # shellcheck disable=SC1090
     . "$DEFAULTS"
+  else
+    RESTORE_WARN+=" defaults-cache-missing-or-untrusted"
   fi
 
   # Unconditional sanity: v3+ never touches turbo/perf-cap, but v1 did and a
@@ -487,29 +557,38 @@ restore() {
   cgroup_restore
 
   # Unconditional re-online (a 1 write to an online cpu is a no-op; also heals
-  # a v3-era state that only offlined 1-5). MUST precede the IRQ restore:
-  # saved masks referencing still-offline CPUs would be EINVAL'd, and the
-  # kernel revives managed nvme queues on re-online before the sweep walks
-  # /proc/irq.
+  # a v3-era state that only offlined 1-5). Verified + once-retried: a cpu
+  # stuck offline is a real leak and must survive into the drift log. MUST
+  # precede the IRQ restore: saved masks referencing still-offline CPUs would
+  # be EINVAL'd, and the kernel revives managed nvme queues on re-online
+  # before the sweep walks /proc/irq.
   local c
-  for c in $HOTPLUG_CPUS; do w 1 "/sys/devices/system/cpu/cpu$c/online"; done
+  for c in $HOTPLUG_CPUS; do
+    wv 1 "/sys/devices/system/cpu/cpu$c/online" || {
+      sleep 0.2
+      wv 1 "/sys/devices/system/cpu/cpu$c/online" || RESTORE_WARN+=" cpu$c-stuck-offline"
+    }
+  done
 
   irq_restore
 
   if [[ -f $RUN_STATE ]]; then
+    # Exact restore; every key falls back to cached/derived stock when absent
+    # (v3-era state) — a missing key must never mean "leave the knob applied".
     local epb
-    epb=$(get_saved epb); : "${epb:=6}"
+    epb=$(get_saved epb); : "${epb:=${DEF_EPB:-6}}"
     local f
     for f in /sys/devices/system/cpu/cpu*/power/energy_perf_bias; do w "$epb" "$f"; done
 
-    w "$(get_saved rapl_msr_pl1)" "$RAPL_MSR/constraint_0_power_limit_uw"
-    w "$(get_saved rapl_msr_pl1_tau)" "$RAPL_MSR/constraint_0_time_window_us"
-    w "$(get_saved rapl_msr_pl2)" "$RAPL_MSR/constraint_1_power_limit_uw"
-    w "$(get_saved rapl_msr_enabled)" "$RAPL_MSR/enabled"
-    w "$(get_saved rapl_mmio_pl1)" "$RAPL_MMIO/constraint_0_power_limit_uw"
-    w "$(get_saved rapl_mmio_pl1_tau)" "$RAPL_MMIO/constraint_0_time_window_us"
-    w "$(get_saved rapl_mmio_pl2)" "$RAPL_MMIO/constraint_1_power_limit_uw"
-    w "$(get_saved rapl_mmio_enabled)" "$RAPL_MMIO/enabled"
+    local val
+    val=$(get_saved rapl_msr_pl1); w "${val:-$DEF_RAPL_MSR_PL1}" "$RAPL_MSR/constraint_0_power_limit_uw"
+    val=$(get_saved rapl_msr_pl1_tau); w "${val:-$DEF_RAPL_MSR_TAU}" "$RAPL_MSR/constraint_0_time_window_us"
+    val=$(get_saved rapl_msr_pl2); w "${val:-$DEF_RAPL_MSR_PL2}" "$RAPL_MSR/constraint_1_power_limit_uw"
+    val=$(get_saved rapl_msr_enabled); w "${val:-${DEF_RAPL_MSR_ENABLED:-1}}" "$RAPL_MSR/enabled"
+    val=$(get_saved rapl_mmio_pl1); w "${val:-$DEF_RAPL_MMIO_PL1}" "$RAPL_MMIO/constraint_0_power_limit_uw"
+    val=$(get_saved rapl_mmio_pl1_tau); w "${val:-$DEF_RAPL_MMIO_TAU}" "$RAPL_MMIO/constraint_0_time_window_us"
+    val=$(get_saved rapl_mmio_pl2); w "${val:-$DEF_RAPL_MMIO_PL2}" "$RAPL_MMIO/constraint_1_power_limit_uw"
+    val=$(get_saved rapl_mmio_enabled); w "${val:-${DEF_RAPL_MMIO_ENABLED:-1}}" "$RAPL_MMIO/enabled"
     # PL4: never write 0/empty to a peak-power limit (w guards empty; guard 0)
     local pl4
     pl4=$(get_saved rapl_msr_pl4); pl4=${pl4:-$DEF_RAPL_MSR_PL4}
@@ -517,18 +596,23 @@ restore() {
     pl4=$(get_saved rapl_mmio_pl4); pl4=${pl4:-$DEF_RAPL_MMIO_PL4}
     [[ -n $pl4 && $pl4 != 0 ]] && w "$pl4" "$RAPL_MMIO/constraint_2_power_limit_uw"
 
-    w "$(get_saved aspm)" "$ASPM"
-    [[ -d $UNCORE ]] && w "$(get_saved uncore_max)" "$UNCORE/max_freq_khz"
+    val=$(get_saved aspm); w "${val:-${DEF_ASPM:-default}}" "$ASPM"
+    if [[ -d $UNCORE ]]; then
+      val=$(get_saved uncore_max)
+      w "${val:-$(cat $UNCORE/initial_max_freq_khz 2>/dev/null)}" "$UNCORE/max_freq_khz"
+    fi
     gpu_restore
     psr_restore
 
     local fp
     fp=$(get_saved fp_path)
-    [[ -n $fp && -d $fp ]] && w "$(get_saved fp_control)" "$fp/power/control"
+    if [[ -n $fp && -d $fp ]]; then
+      val=$(get_saved fp_control)
+      w "${val:-${DEF_FP_CONTROL:-on}}" "$fp/power/control"
+    fi
 
-    local sndv
-    sndv=$(get_saved snd_power_save)
-    w "${sndv:-${DEF_SND_POWER_SAVE:-10}}" "$SND"
+    val=$(get_saved snd_power_save)
+    w "${val:-${DEF_SND_POWER_SAVE:-10}}" "$SND"
 
     # Restore the governor whenever it differs from the snapshot — covers a
     # conf change between on and off, not just the current SPS_CPUIDLE_GOV.
@@ -536,57 +620,73 @@ restore() {
     gov=$(get_saved cpuidle_governor); gov=${gov:-${DEF_CPUIDLE_GOV:-menu}}
     [[ $(cat "$CPUIDLE" 2>/dev/null) != "$gov" ]] && w "$gov" "$CPUIDLE"
 
-    w "$(get_saved nmi_watchdog)" /proc/sys/kernel/nmi_watchdog
-    w "$(get_saved dirty_writeback)" /proc/sys/vm/dirty_writeback_centisecs
-    w "$(get_saved laptop_mode)" /proc/sys/vm/laptop_mode
+    val=$(get_saved nmi_watchdog); w "${val:-${DEF_NMI_WATCHDOG:-1}}" /proc/sys/kernel/nmi_watchdog
+    val=$(get_saved dirty_writeback); w "${val:-${DEF_DIRTY_WRITEBACK:-500}}" /proc/sys/vm/dirty_writeback_centisecs
+    val=$(get_saved laptop_mode); w "${val:-${DEF_LAPTOP_MODE:-0}}" /proc/sys/vm/laptop_mode
 
-    [[ $(get_saved snapper_timeline_was_active) == active ]] && systemctl start "$SNAPPER_TIMER"
-    [[ $(get_saved thermald_was_active) == active ]] && systemctl start thermald.service
-    rm -f "$RUN_STATE" "$DRIFT_LOG"
+    # Missing key (v3-era/partial state) falls back to the no-state behavior
+    # instead of leaving the unit stopped forever.
+    local snap therm
+    snap=$(get_saved snapper_timeline_was_active)
+    if [[ $snap == active ]] ||
+      { [[ -z $snap ]] && timeout 25 systemctl is-enabled --quiet "$SNAPPER_TIMER" 2>/dev/null; }; then
+      timeout -k 5 25 systemctl --no-block start "$SNAPPER_TIMER" 2>/dev/null
+    fi
+    therm=$(get_saved thermald_was_active)
+    [[ $therm == active || -z $therm ]] &&
+      timeout -k 5 25 systemctl --no-block start thermald.service 2>/dev/null
+
+    rm -f "$RUN_STATE"
   else
-    # No saved state (state file lost without a reboot, or 'off' after boot):
-    # restore stock values from the defaults cached at setup time (sourced at
-    # the top of restore), falling back to sane hardware defaults where no
-    # cache exists. Cgroups and IRQs were already reset above.
+    # No saved state (state file lost without a reboot, truncated snapshot, or
+    # 'off' after boot): stock values from the setup-time cache, with
+    # hardware-derived last resorts. Cgroups and IRQs were already reset above.
+    # RAPL last resort = the zone's constraint maxima (stock-or-higher-than-
+    # any-clamp, never 0/empty).
     local f
-    for f in /sys/devices/system/cpu/cpu*/power/energy_perf_bias; do w 6 "$f"; done
-    w default "$ASPM"
-    w "${DEF_RAPL_MSR_PL1}" "$RAPL_MSR/constraint_0_power_limit_uw"
-    w "${DEF_RAPL_MSR_TAU}" "$RAPL_MSR/constraint_0_time_window_us"
-    w "${DEF_RAPL_MSR_PL2}" "$RAPL_MSR/constraint_1_power_limit_uw"
-    w "${DEF_RAPL_MMIO_PL1}" "$RAPL_MMIO/constraint_0_power_limit_uw"
-    w "${DEF_RAPL_MMIO_TAU}" "$RAPL_MMIO/constraint_0_time_window_us"
-    w "${DEF_RAPL_MMIO_PL2}" "$RAPL_MMIO/constraint_1_power_limit_uw"
-    [[ -n $DEF_RAPL_MSR_PL4 && $DEF_RAPL_MSR_PL4 != 0 ]] &&
-      w "$DEF_RAPL_MSR_PL4" "$RAPL_MSR/constraint_2_power_limit_uw"
-    [[ -n $DEF_RAPL_MMIO_PL4 && $DEF_RAPL_MMIO_PL4 != 0 ]] &&
-      w "$DEF_RAPL_MMIO_PL4" "$RAPL_MMIO/constraint_2_power_limit_uw"
+    for f in /sys/devices/system/cpu/cpu*/power/energy_perf_bias; do w "${DEF_EPB:-6}" "$f"; done
+    w "${DEF_ASPM:-default}" "$ASPM"
+    local pl
+    pl=${DEF_RAPL_MSR_PL1:-$(cat $RAPL_MSR/constraint_0_max_power_uw 2>/dev/null)}
+    w "$pl" "$RAPL_MSR/constraint_0_power_limit_uw"
+    w "${DEF_RAPL_MSR_TAU:-28000000}" "$RAPL_MSR/constraint_0_time_window_us"
+    pl=${DEF_RAPL_MSR_PL2:-$(cat $RAPL_MSR/constraint_1_max_power_uw 2>/dev/null)}
+    w "$pl" "$RAPL_MSR/constraint_1_power_limit_uw"
+    w "${DEF_RAPL_MSR_ENABLED:-1}" "$RAPL_MSR/enabled"
+    pl=${DEF_RAPL_MMIO_PL1:-$(cat $RAPL_MMIO/constraint_0_max_power_uw 2>/dev/null)}
+    w "$pl" "$RAPL_MMIO/constraint_0_power_limit_uw"
+    w "${DEF_RAPL_MMIO_TAU:-28000000}" "$RAPL_MMIO/constraint_0_time_window_us"
+    pl=${DEF_RAPL_MMIO_PL2:-$(cat $RAPL_MMIO/constraint_1_max_power_uw 2>/dev/null)}
+    w "$pl" "$RAPL_MMIO/constraint_1_power_limit_uw"
+    w "${DEF_RAPL_MMIO_ENABLED:-1}" "$RAPL_MMIO/enabled"
+    pl=${DEF_RAPL_MSR_PL4:-$(cat $RAPL_MSR/constraint_2_max_power_uw 2>/dev/null)}
+    [[ -n $pl && $pl != 0 ]] && w "$pl" "$RAPL_MSR/constraint_2_power_limit_uw"
+    pl=${DEF_RAPL_MMIO_PL4:-$(cat $RAPL_MMIO/constraint_2_max_power_uw 2>/dev/null)}
+    [[ -n $pl && $pl != 0 ]] && w "$pl" "$RAPL_MMIO/constraint_2_power_limit_uw"
     [[ -d $UNCORE && -f $UNCORE/initial_max_freq_khz ]] &&
       w "$(cat $UNCORE/initial_max_freq_khz)" "$UNCORE/max_freq_khz"
-    local g
-    for g in "$GPU"/gt/gt*; do
-      [[ -f $g/rps_RP0_freq_mhz ]] || continue
-      w "$(cat "$g/rps_RP0_freq_mhz")" "$g/rps_max_freq_mhz"
-      w "$(cat "$g/rps_RP0_freq_mhz")" "$g/rps_boost_freq_mhz"
-      [[ -f $g/slpc_power_profile ]] && case $(basename "$g") in
-        gt0) w "${DEF_SLPC_GT0:-base}" "$g/slpc_power_profile" ;;
-        gt1) w "${DEF_SLPC_GT1:-base}" "$g/slpc_power_profile" ;;
-      esac
-    done
-    w "$(cat "$GPU/gt_RP0_freq_mhz" 2>/dev/null)" "$GPU/gt_max_freq_mhz"
-    w "$(cat "$GPU/gt_RP0_freq_mhz" 2>/dev/null)" "$GPU/gt_boost_freq_mhz"
+    gpu_restore
     find_psr && w 0 "$PSR_DEBUG"
     local fp
-    fp=$(fp_find 2>/dev/null) && w on "$fp/power/control"
+    fp=$(fp_find 2>/dev/null) && w "${DEF_FP_CONTROL:-on}" "$fp/power/control"
     w "${DEF_SND_POWER_SAVE:-10}" "$SND"
     w "${DEF_CPUIDLE_GOV:-menu}" "$CPUIDLE"
-    w 1 /proc/sys/kernel/nmi_watchdog
-    w 500 /proc/sys/vm/dirty_writeback_centisecs
-    w 0 /proc/sys/vm/laptop_mode
-    systemctl is-enabled --quiet "$SNAPPER_TIMER" 2>/dev/null && systemctl start "$SNAPPER_TIMER"
-    systemctl start thermald.service 2>/dev/null
+    w "${DEF_NMI_WATCHDOG:-1}" /proc/sys/kernel/nmi_watchdog
+    w "${DEF_DIRTY_WRITEBACK:-500}" /proc/sys/vm/dirty_writeback_centisecs
+    w "${DEF_LAPTOP_MODE:-0}" /proc/sys/vm/laptop_mode
+    timeout 25 systemctl is-enabled --quiet "$SNAPPER_TIMER" 2>/dev/null &&
+      timeout -k 5 25 systemctl --no-block start "$SNAPPER_TIMER" 2>/dev/null
+    timeout -k 5 25 systemctl --no-block start thermald.service 2>/dev/null
+  fi
+
+  # Drift log: normally removed with the state; kept (with a summary line)
+  # when the restore itself hit trouble, so diag has evidence after the fact.
+  if [[ -n $RESTORE_WARN ]]; then
+    echo "$(date +%s) restore warnings:$RESTORE_WARN" >>"$DRIFT_LOG"
+  else
     rm -f "$DRIFT_LOG"
   fi
+  return 0
 }
 
 reassert() {
@@ -595,15 +695,17 @@ reassert() {
   # for the rest of the session). apply_knobs is idempotent with drift guards.
   # The user-side watcher only calls this on observed drift or AC transition.
   # Lock first, THEN re-check: an in-flight 'off' may have just restored
-  # everything — re-pinning after it would leak the whole mode.
+  # everything — re-pinning after it would leak the whole mode. Exit 3 is the
+  # distinct "no root state" signal (callers reconcile instead of retrying).
   lock
-  [[ -f $RUN_STATE ]] || exit 0
+  [[ -f $RUN_STATE ]] || exit 3
+  state_truncated && exit 3
   apply_knobs
   exit 0
 }
 
 diag() {
-  echo "=== super-power-saver diag $(date +%T) (mode $([[ -f $RUN_STATE ]] && echo ON || echo OFF), state v$(get_saved v 2>/dev/null)) ==="
+  echo "=== super-power-saver diag $(date +%T) (mode $([[ -f $RUN_STATE ]] && echo ON || echo OFF), state v$(get_saved v)) ==="
   if find_psr; then
     echo "--- PSR ($PSR_STATUS)"
     head -15 "$PSR_STATUS" 2>/dev/null
@@ -621,8 +723,8 @@ diag() {
   total=$(ls -d /proc/irq/[0-9]* 2>/dev/null | wc -l)
   lp=$(grep -lx "$LP_CPUS" /proc/irq/[0-9]*/smp_affinity_list 2>/dev/null | wc -l)
   echo "--- IRQs on $LP_CPUS: $lp/$total  default_smp_affinity: $(cat /proc/irq/default_smp_affinity 2>/dev/null)"
-  echo "--- slices AllowedCPUs: user='$(systemctl show -p AllowedCPUs --value user.slice 2>/dev/null)' system='$(systemctl show -p AllowedCPUs --value system.slice 2>/dev/null)' machine='$(systemctl show -p AllowedCPUs --value machine.slice 2>/dev/null)'  user effective: $(cat /sys/fs/cgroup/user.slice/cpuset.cpus.effective 2>/dev/null)"
-  echo "--- snd_hda power_save: $(cat $SND 2>/dev/null)  snapper-timeline: $(systemctl is-active $SNAPPER_TIMER 2>/dev/null)  thermald: $(systemctl is-active thermald.service 2>/dev/null)"
+  echo "--- slices AllowedCPUs: user='$(timeout 25 systemctl show -p AllowedCPUs --value user.slice 2>/dev/null)' system='$(timeout 25 systemctl show -p AllowedCPUs --value system.slice 2>/dev/null)' machine='$(timeout 25 systemctl show -p AllowedCPUs --value machine.slice 2>/dev/null)'  user effective: $(cat /sys/fs/cgroup/user.slice/cpuset.cpus.effective 2>/dev/null)"
+  echo "--- snd_hda power_save: $(cat $SND 2>/dev/null)  snapper-timeline: $(timeout 25 systemctl is-active $SNAPPER_TIMER 2>/dev/null)  thermald: $(timeout 25 systemctl is-active thermald.service 2>/dev/null)"
   if [[ -f $DRIFT_LOG ]]; then
     echo "--- write-drift log ($(wc -l <"$DRIFT_LOG") entries; MMIO lines = expected EC behavior):"
     tail -5 "$DRIFT_LOG"
@@ -640,7 +742,7 @@ diag() {
   exit 0
 }
 
-case "${1:-}" in
+case "$VERB" in
 on) apply ;;
 off) restore ;;
 reassert) reassert ;;
@@ -648,36 +750,70 @@ diag) diag ;;
 *) echo "Usage: omarchy-super-power-saver-helper on|off|reassert|diag" >&2; exit 1 ;;
 esac
 HELPER
-chmod 755 /usr/local/bin/omarchy-super-power-saver-helper
-chown root:root /usr/local/bin/omarchy-super-power-saver-helper
-echo "installed /usr/local/bin/omarchy-super-power-saver-helper (v4)"
+chmod 755 "$HELPER_TMP"
+chown root:root "$HELPER_TMP"
+mv -f "$HELPER_TMP" /usr/local/bin/omarchy-super-power-saver-helper
+echo "installed /usr/local/bin/omarchy-super-power-saver-helper (v4, atomic replace)"
 
 # ------------------------- cache stock defaults for the no-state fallback
-if [[ ! -f /run/omarchy-super-power-saver.state ]]; then
-  slpc_tok() { grep -o '\[[a-z_]*\]' "$1" 2>/dev/null | tr -d '[]'; }
+# Guard on BOTH halves of the mode being off: the helper /run state AND a
+# fresh (same-boot) user-side state — a first-ever setup run while the mode
+# is user-side-on would otherwise cache power-saver/quiet EC values as stock.
+# A stale (pre-reboot) user state must NOT block caching: sysfs is stock again.
+USER_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+USER_STATE="$USER_HOME/.local/state/omarchy-super-power-saver/state"
+user_mode_fresh() {
+  [[ -f $USER_STATE ]] &&
+    [[ $(grep '^boot_id=' "$USER_STATE" 2>/dev/null | cut -d= -f2) == $(cat /proc/sys/kernel/random/boot_id) ]]
+}
+slpc_tok() { grep -o '\[[a-z_]*\]' "$1" 2>/dev/null | tr -d '[]'; }
+fp_dev() {
+  local d
+  for d in /sys/bus/usb/devices/*; do
+    [[ -f $d/idVendor && -f $d/idProduct ]] || continue
+    [[ $(cat "$d/idVendor") == 06cb && $(cat "$d/idProduct") == 0701 ]] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+if [[ ! -f /run/omarchy-super-power-saver.state ]] && ! user_mode_fresh; then
+  FP_DEV=$(fp_dev || true)
   cat >/etc/omarchy-super-power-saver.defaults <<EOF
 # Stock values captured by omarchy-super-power-saver-setup on $(date -I).
-# Used by the helper's restore() when no /run state exists. Re-run setup after
-# BIOS updates to refresh.
+# Used by the helper's restore() when no /run state exists (or keys are
+# missing from a version-skewed state). Re-run setup after BIOS updates.
 DEF_RAPL_MSR_PL1=$(cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw 2>/dev/null)
 DEF_RAPL_MSR_TAU=$(cat /sys/class/powercap/intel-rapl:0/constraint_0_time_window_us 2>/dev/null)
 DEF_RAPL_MSR_PL2=$(cat /sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw 2>/dev/null)
 DEF_RAPL_MSR_PL4=$(cat /sys/class/powercap/intel-rapl:0/constraint_2_power_limit_uw 2>/dev/null)
+DEF_RAPL_MSR_ENABLED=$(cat /sys/class/powercap/intel-rapl:0/enabled 2>/dev/null)
 DEF_RAPL_MMIO_PL1=$(cat /sys/class/powercap/intel-rapl-mmio:0/constraint_0_power_limit_uw 2>/dev/null)
 DEF_RAPL_MMIO_TAU=$(cat /sys/class/powercap/intel-rapl-mmio:0/constraint_0_time_window_us 2>/dev/null)
 DEF_RAPL_MMIO_PL2=$(cat /sys/class/powercap/intel-rapl-mmio:0/constraint_1_power_limit_uw 2>/dev/null)
 DEF_RAPL_MMIO_PL4=$(cat /sys/class/powercap/intel-rapl-mmio:0/constraint_2_power_limit_uw 2>/dev/null)
+DEF_RAPL_MMIO_ENABLED=$(cat /sys/class/powercap/intel-rapl-mmio:0/enabled 2>/dev/null)
+DEF_ASPM=$(grep -o '\[.*\]' /sys/module/pcie_aspm/parameters/policy 2>/dev/null | tr -d '[]')
+DEF_EPB=$(cat /sys/devices/system/cpu/cpu0/power/energy_perf_bias 2>/dev/null)
+DEF_NMI_WATCHDOG=$(cat /proc/sys/kernel/nmi_watchdog 2>/dev/null)
+DEF_DIRTY_WRITEBACK=$(cat /proc/sys/vm/dirty_writeback_centisecs 2>/dev/null)
+DEF_LAPTOP_MODE=$(cat /proc/sys/vm/laptop_mode 2>/dev/null)
+DEF_FP_CONTROL=${FP_DEV:+$(cat "$FP_DEV/power/control" 2>/dev/null)}
 DEF_SND_POWER_SAVE=$(cat /sys/module/snd_hda_intel/parameters/power_save 2>/dev/null)
 DEF_SLPC_GT0=$(slpc_tok /sys/class/drm/card0/gt/gt0/slpc_power_profile)
 DEF_SLPC_GT1=$(slpc_tok /sys/class/drm/card0/gt/gt1/slpc_power_profile)
+DEF_GPU_MAX=$(cat /sys/class/drm/card0/gt_max_freq_mhz 2>/dev/null)
+DEF_GPU_BOOST=$(cat /sys/class/drm/card0/gt_boost_freq_mhz 2>/dev/null)
+DEF_GT0_MAX=$(cat /sys/class/drm/card0/gt/gt0/rps_max_freq_mhz 2>/dev/null)
+DEF_GT0_BOOST=$(cat /sys/class/drm/card0/gt/gt0/rps_boost_freq_mhz 2>/dev/null)
+DEF_GT1_MAX=$(cat /sys/class/drm/card0/gt/gt1/rps_max_freq_mhz 2>/dev/null)
+DEF_GT1_BOOST=$(cat /sys/class/drm/card0/gt/gt1/rps_boost_freq_mhz 2>/dev/null)
 DEF_CPUIDLE_GOV=$(cat /sys/devices/system/cpu/cpuidle/current_governor 2>/dev/null)
 DEF_IRQ_DEFAULT_AFF=$(cat /proc/irq/default_smp_affinity 2>/dev/null)
 EOF
   chmod 644 /etc/omarchy-super-power-saver.defaults
   echo "cached stock defaults to /etc/omarchy-super-power-saver.defaults"
 else
-  echo "NOTE: super power saver appears ACTIVE — skipped caching stock defaults."
-  echo "      Toggle it off and re-run setup once to cache stock values."
+  echo "NOTE: super power saver appears ACTIVE (helper or user-side state) —"
+  echo "      skipped caching stock defaults. Toggle it off and re-run setup once."
 fi
 
 # -------------------------------------------------------------------- sudoers

@@ -89,8 +89,9 @@ snapshot() { # <name>
       echo "cg_${s}_allowed=$(systemctl show -p AllowedCPUs --value $s.slice 2>/dev/null)"
       echo "cg_${s}_cpus=$(rd /sys/fs/cgroup/$s.slice/cpuset.cpus)"
     done
-    echo "thermald=$(systemctl is-active thermald.service 2>/dev/null)"
-    echo "snapper_timer=$(systemctl is-active snapper-timeline.timer 2>/dev/null)"
+    # normalize 'activating' -> 'active': the helper starts these --no-block
+    echo "thermald=$(systemctl is-active thermald.service 2>/dev/null | sed 's/^activating$/active/')"
+    echo "snapper_timer=$(systemctl is-active snapper-timeline.timer 2>/dev/null | sed 's/^activating$/active/')"
     echo "bt_soft_blocked=$(rfkill list bluetooth 2>/dev/null | grep -c 'Soft blocked: yes')"
     local iface w=""
     for iface in /sys/class/net/*/wireless; do
@@ -107,7 +108,10 @@ snapshot() { # <name>
 }
 
 echo "== scope test, output in $OUT"
-[[ $("$SPS" status) == off ]] || { echo "mode must be OFF to start" >&2; exit 1; }
+# 'status' says off for a STALE state file too, but do_on's stale cleanup
+# would then mutate state after the pre snapshot — require a truly clean slate.
+[[ $("$SPS" status) == off && ! -e $STATE_FILE && ! -e /run/omarchy-super-power-saver.state ]] ||
+  { echo "mode must be OFF with no leftover state — run '$SPS off' first and retry" >&2; exit 1; }
 
 echo "== snapshot: pre"
 snapshot pre
