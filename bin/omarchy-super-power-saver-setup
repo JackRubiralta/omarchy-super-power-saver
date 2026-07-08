@@ -1005,6 +1005,31 @@ udevadm trigger --subsystem-match=drm
 echo "installed /etc/udev/rules.d/61-igpu-dev-path.rules"
 [[ -e /dev/dri/igpu ]] && echo "/dev/dri/igpu -> $(readlink -f /dev/dri/igpu)"
 
+# ------------------------------------------ browser battery defaults (Firefox)
+# Firefox >= 137 hw-decodes video by default (no prefs needed); what's left is
+# background churn: session-restore writes every 15s, captive-portal probes,
+# telemetry. Shipped as an enterprise-policy DEFAULT branch: survives updates,
+# covers every profile, and user about:config changes still win. Installed
+# only when no policies.json exists — never overwrite someone's policies.
+# source: config/ sibling when run from the repo checkout, else the clone
+FF_POLICY_SRC=$(dirname "$(readlink -f "$0")")/../config/firefox-policies.json
+[[ -f $FF_POLICY_SRC ]] || FF_POLICY_SRC="$USER_HOME/omarchy-super-power-saver/config/firefox-policies.json"
+if [[ -f $FF_POLICY_SRC ]]; then
+  if [[ -f /etc/firefox/policies/policies.json ]]; then
+    if grep -q omarchy-super-power-saver /etc/firefox/policies/policies.json; then
+      install -D -m 644 "$FF_POLICY_SRC" /etc/firefox/policies/policies.json
+      echo "refreshed /etc/firefox/policies/policies.json (ours)"
+    else
+      echo "NOTE: /etc/firefox/policies/policies.json exists and is not ours — left untouched."
+    fi
+  else
+    install -D -m 644 "$FF_POLICY_SRC" /etc/firefox/policies/policies.json
+    echo "installed /etc/firefox/policies/policies.json (battery defaults; check about:policies)"
+  fi
+else
+  echo "NOTE: firefox-policies.json not found next to the repo — skipped browser policies."
+fi
+
 # ------------------------------------------------------- verification tooling
 pacman -S --needed --noconfirm intel-gpu-tools libva-utils nvme-cli linux-tools >/dev/null &&
   echo "installed verification tooling (intel-gpu-tools libva-utils nvme-cli linux-tools)" ||
