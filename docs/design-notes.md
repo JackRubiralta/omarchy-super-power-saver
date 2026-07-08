@@ -435,3 +435,27 @@ masks < 0x1000 would false-fail), the scope test must replicate the helper's
 conf trust gate or a mis-permissioned conf makes test and helper disagree,
 and stray exported `SPS_*` env vars must be unset before sourcing the conf in
 tests (sudo's env_reset makes the helper immune; tests aren't).
+
+### Quick-tier results (2026-07-08, ab-20260708-1926) — D shipped as default
+
+Idle (vs stock power-saver 4.06 W, A-repeat noise 0.031 W): C −0.52 W,
+D −0.39 W, B −0.23 W (below the 0.3 W quick gate). So the consolidation
+itself earns ~0.3 W beyond the non-topology knobs — Jack's "fewer cores might
+not help" is refuted at idle, and cpu0-in-pin costs only 0.13 W (an idle
+online P-core in deep C-states is nearly free, as pre-registered).
+
+Fixed work (byte-identical xz job, battery J over [start → back-to-idle]):
+D 73 s / 526 J beat B 79 s / 565 J beat C 93 s / 589 J. Race-to-idle
+confirmed under load: the strict LP-E pin costs ~11% more energy per job.
+RAPL package J agreed on ordering (239 / 266 / 305).
+
+Responsiveness: C's lag mechanism is single-thread starvation (st_chunk 88 ms
+vs stock 44 ms, 2×) plus doubled timer-wakeup jitter. D restores burst speed
+to better-than-stock (32 ms — cpu0 at full boost under the 10 W PL1) and
+improves wake p99 (458 µs vs C's 561 µs). D technically failed the
+pre-registered spawn-p95 line (137 ms, 3.4× stock) — n=10 with one outlier;
+p50 beat C — while no variant that saves meaningful power passed it. Winner
+by Jack's stated rule ("least-power variant that feels smooth, ~0.2–0.5 W
+cost acceptable"): **D**, shipped as PIN_CPUS="0,14-15" (IRQ mask c001).
+C remains one conf line away; E (E-core pair) and the teo/PL1 sweeps remain
+unmeasured — run the thorough tier if D still feels laggy.

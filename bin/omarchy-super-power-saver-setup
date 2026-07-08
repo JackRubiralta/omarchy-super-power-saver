@@ -97,8 +97,13 @@ VERB="${1:-}"
 # re-online set and stays FIXED: a conf edit between on and off must never
 # strand a core offline (writing 1 to an online cpu is a no-op).
 ONLINE_CPUS="0,14-15" # SPS_ONLINE_CPUS: CPUs left online while the mode is on
-PIN_CPUS="14-15"      # SPS_ALLOWED_CPUS: slice AllowedCPUs pin ("" = no pin)
+PIN_CPUS="0,14-15"    # SPS_ALLOWED_CPUS: slice AllowedCPUs pin ("" = no pin)
 IRQ_STEER=1           # SPS_IRQ_STEER: steer IRQs + default_smp_affinity (0/1)
+# Default pin includes cpu0 since the 2026-07-08 A/B run: vs the LP-E-only pin
+# it costs 0.13W at idle (still -0.39W vs stock power-saver) but is 11% MORE
+# efficient per unit of work (race-to-idle: 526J vs 589J for the same job) and
+# restores stock-level single-thread burst speed (the "mode feels laggy" fix).
+# The strict pin is one conf line away: SPS_ALLOWED_CPUS=14-15.
 ALL_HOTPLUG="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15"
 SLICES="user.slice system.slice machine.slice"
 
@@ -1014,6 +1019,6 @@ echo "  SPS_CPUIDLE_GOV=teo        # cpuidle governor while mode is on"
 echo "  SPS_PL1_UW=7000000         # PL1 variant (default 10000000)"
 echo "  SPS_PL2_UW=10000000        # PL2 variant (default 15000000)"
 echo "  SPS_ONLINE_CPUS=0,14-15    # CPUs kept online (must contain 0,14,15)"
-echo "  SPS_ALLOWED_CPUS=14-15     # slice AllowedCPUs pin (subset of online; empty = no pin)"
+echo "  SPS_ALLOWED_CPUS=0,14-15   # slice AllowedCPUs pin (subset of online; empty = no pin)"
 echo "  SPS_IRQ_STEER=1            # 0 = leave IRQ affinities alone"
 echo "Toggle the mode off->on after editing the conf."

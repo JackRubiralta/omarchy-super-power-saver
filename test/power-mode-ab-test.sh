@@ -73,8 +73,8 @@ TIMER_CANDIDATES="snapper-timeline.timer snapper-cleanup.timer plocate-updatedb.
 V_A="A|stock|power-saver"
 V_B="B|super|SPS_ONLINE_CPUS=0-15;SPS_ALLOWED_CPUS=;SPS_IRQ_STEER=0"
 V_B2="B2|super|SPS_ONLINE_CPUS=0-15;SPS_ALLOWED_CPUS=14-15;SPS_IRQ_STEER=1"
-V_C="C|super|"
-V_D="D|super|SPS_ALLOWED_CPUS=0,14-15"
+V_C="C|super|SPS_ALLOWED_CPUS=14-15" # strict LP-E pin (pre-2026-07-08 default)
+V_D="D|super|" # shipped default since 2026-07-08: pin 0,14-15 (measured winner)
 V_E="E|super|SPS_ONLINE_CPUS=0,6-7,14-15;SPS_ALLOWED_CPUS=0,6-7,14-15;SPS_IRQ_STEER=1"
 V_F="F|super|SPS_CPUIDLE_GOV=teo"
 V_BAL="BAL|stock|balanced"
@@ -134,7 +134,7 @@ mask_of_cpulist() {
 # Derive expected topology from a super variant's conf fragment (defaults =
 # the helper's shipped defaults). Sets EXP_ONLINE, EXP_PIN, EXP_MASK, EXP_STEER.
 derive_expect() { # conf-fragment
-  EXP_ONLINE="0,14-15" EXP_PIN="14-15" EXP_STEER=1
+  EXP_ONLINE="0,14-15" EXP_PIN="0,14-15" EXP_STEER=1 # = helper shipped defaults
   local kv k v
   local IFS=';'
   for kv in $1; do

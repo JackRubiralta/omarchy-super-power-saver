@@ -16,7 +16,7 @@ On top of ppd `power-saver` (EPP=power, Dell platform_profile `quiet`):
 
 | Layer | Knob |
 |---|---|
-| CPU | **LP-E island consolidation**: P-cores 1-5 + E-cores 6-13 offlined; `user/system/machine.slice` pinned to the low-power SoC-tile cores (cpu14-15) via `AllowedCPUs`; all device IRQs + `default_smp_affinity` steered there (managed NVMe queue IRQs and the dGPU are left alone) |
+| CPU | **LP-E island consolidation**: P-cores 1-5 + E-cores 6-13 offlined; `user/system/machine.slice` pinned to cpu0 + the low-power SoC-tile cores (cpu14-15) via `AllowedCPUs`; device IRQs + `default_smp_affinity` steered to the same set (managed NVMe queue IRQs and the dGPU are left alone). cpu0 is in the pin since the measured A/B (see below): it can't be offlined anyway, and letting bursts race-to-idle on it is both faster **and** cheaper than forcing everything onto the 2.5 GHz LP-E pair |
 | CPU | RAPL PL1=10W (tau 8s) / PL2=15W / **PL4=25W** in both MSR and MMIO zones; EPB=15; thermald paused (it would raise the caps) |
 | Fabric | uncore frequency pinned to its floor; `pcie_aspm=powersupersave` |
 | iGPU | render GT capped to its efficient frequency; **SLPC `power_saving` profile** on both GTs (kills waitboost); media GT frequency range untouched (video decode) |
@@ -77,7 +77,7 @@ SPS_CPUIDLE_GOV=teo        # cpuidle governor while the mode is on
 SPS_PL1_UW=7000000         # long-term power cap variant (default 10W)
 SPS_PL2_UW=10000000        # short-term cap variant (default 15W)
 SPS_ONLINE_CPUS=0,14-15    # CPUs kept online (must contain 0, 14, 15)
-SPS_ALLOWED_CPUS=14-15     # slice AllowedCPUs pin (subset of online; empty = no pin)
+SPS_ALLOWED_CPUS=0,14-15   # slice AllowedCPUs pin (subset of online; empty = no pin)
 SPS_IRQ_STEER=1            # 0 = leave IRQ affinities alone
 ```
 
@@ -107,6 +107,21 @@ and a lag budget (process-spawn p95 ≤ 2× stock, timer-wakeup p99 ≤ 1.5×
 stock) that turns "feels laggy" into a pass/fail line. Results land in
 `test/results/` (gitignored); `analyze <outdir>` recomputes the report from
 the raw CSVs.
+
+### Measured (2026-07-08, quick tier, reference machine on battery)
+
+| variant | idle Δ vs stock power-saver | fixed job (xz) | single-thread burst |
+|---|---|---|---|
+| B — all knobs, no consolidation | −0.23 W (below noise gate) | 79 s / 565 J | ≈ stock |
+| C — strict LP-E pin (old default) | **−0.52 W** | 93 s / 589 J | 2× slower than stock |
+| D — pin 0,14-15 (**shipped default**) | **−0.39 W** | **73 s / 526 J** | ≈ stock (32 ms vs 44 ms chunk) |
+
+Takeaways: the consolidation is what earns the idle savings (B ≈ nothing),
+but under load race-to-idle wins — the strict pin costs ~11% more energy per
+job than letting cpu0 sprint and sleep. D keeps 75% of C's idle savings, is
+the cheapest per unit of work, and removes the mode's perceived lag; that
+trade (0.13 W at idle for stock-speed bursts) is the shipped default. The
+strict pin remains one conf line away (`SPS_ALLOWED_CPUS=14-15`).
 
 ## Design notes
 
