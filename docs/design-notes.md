@@ -345,3 +345,93 @@ Raw data + test script: ./power-mode-test-data/ (580 samples, 0 not-discharging 
 - hyprctl reload reverts keyword-set options but NOT `keyword env` vars.
 - `hyprctl getoption misc:vfr` doesn't exist on 0.55.2 — it's `debug:vfr`,
   default on; leave it.
+
+## v4.2 (2026-07-08) — conf-driven consolidation topology + empirical A/B harness
+
+Jack's challenge: "sometimes using less cores does not make it more
+efficient" — the LP-E consolidation was research-driven, never measured on
+this machine; and the mode felt laggy (all userspace on 2× 2.5GHz LP-E cores
+while cpu0, a 5.4GHz P-core that cannot be offlined, idled outside every
+slice's AllowedCPUs — paying its idle cost, using none of its speed).
+
+### Topology became configuration
+
+Three new `/etc/omarchy-super-power-saver.conf` keys (same guarded sourcing:
+root-owned, not group/other-writable, validated before use):
+
+- `SPS_ONLINE_CPUS` (default `0,14-15`) — offline set derived as complement
+- `SPS_ALLOWED_CPUS` (default `14-15`) — empty means "no cgroup pin"
+- `SPS_IRQ_STEER` (default `1`) — IRQ mask derived from pin set (else online set)
+
+Validation invariants (this feeds a NOPASSWD root shell): cpulist parts
+limited to 1–2 digits **before** arithmetic (bash silently wraps 64-bit —
+`9223372036854775808` would pass `<= 15` after wrap and either offline the
+LP-E island or spin the fill loop ~2^63 times), online must contain 0/14/15,
+allowed ⊆ online, everything canonicalized (expand→compress) so guarded
+writers can string-compare against kernel cpulist prints. Bad values → shipped
+defaults + deduplicated drift-log line that survives a clean `off`.
+
+Restore stays conf-INDEPENDENT: it re-onlines all of cpu1-15 unconditionally
+and restores IRQs/cgroups from the saved snapshot — a conf edited (or
+deleted) between on and off cannot strand a core. `reassert` re-reads the
+conf but refuses to half-apply topology: pinning slices at still-offline CPUs
+makes cgroup v2 fall back to the parent's effective set, silently
+*un*-confining userspace, so `cgroup_apply` skips (and logs) when no pin-set
+CPU is online. Watcher expectations were already observed-post-apply, so
+variants flow through with zero watcher changes.
+
+### The A/B harness (test/power-mode-ab-test.sh)
+
+Methodology (why it looks the way it does):
+
+- BAT0 has no `power_now`; power = current×voltage. The Dell EC smooths
+  readings, so a visit's 60 samples are ~1 effective observation — inference
+  is on **per-visit medians across visits**, never per-sample stats.
+- **Baseline-bracketed randomized blocks**: A(stock power-saver) → shuffled
+  test variants → A; each variant scored as Δ vs the linear interpolation of
+  the bracketing A medians. Cancels SoC/voltage/thermal drift better than
+  fixed ABAB. Decision rule: same sign across blocks AND |Δ| ≥ max(0.3 W
+  quick / 0.2 W thorough, 2× A-repeat noise).
+- **Fixed-work loads, never fixed-time**: xz -6 of a byte-identical tmpfs
+  file; energy window runs to "back within 0.3 W of that variant's own idle
+  median" so race-to-idle gets credit for its sleep tail. Battery J primary,
+  RAPL package J (wrap-corrected) as attribution only — package ≠ platform.
+- **Lag budget** converts "kinda laggy": python-spawn p95 ≤ 2× stock,
+  timer-wakeup p99 ≤ 1.5× stock (also discriminates teo/menu and LP-E
+  C-state exit). Benches run as ordinary user-session processes so they
+  inherit the variant's confinement exactly like real apps; `/proc/self/status
+  Cpus_allowed_list` is logged as proof.
+- Confound control: hypridle killed (Wayland idle-notify — systemd-inhibit
+  can't stop it; 150s screensaver otherwise fires mid-run), system timers
+  paused for the WHOLE run (fairness — super pauses snapper, stock must not
+  be penalized), zero terminal output during measurement (PSR2), browser
+  preflight refusal, one long-lived root RAPL sampler (per-sample sudo =
+  auth-journal disk wakes every 2s) that self-terminates by watching the
+  harness pid (user-side cleanup can't signal a root process), dGPU
+  runtime_status asserted per sample, AC-plug aborts in idle AND W1 phases.
+- Every mutation happens after the EXIT/INT/TERM traps are armed and is
+  restored data-driven from recorded initial state.
+
+Variant matrix: A=stock power-saver, B=super minus consolidation (all knobs,
+16 CPUs, no pin/steer), B2=pin without offlining, C=shipped default,
+D=pin 0,14-15 (the lag-fix candidate), E=E-core pair (0,6-7,14-15),
+F=teo governor, PL1 sweep load-only. Quick tier = A/B/C/D (the core
+hypothesis quartet), 1 block, ~40 min; thorough = all, 3 blocks, ~3 h.
+
+Pre-registered predictions (written before the run): C ≈ D at idle (an idle
+online cpu0 in deep C-state should cost ≈0 W → D is a free lag fix); B loses
+≤0.3 W idle but wins joules-per-work under load.
+
+### Review findings worth remembering
+
+Two adversarial review agents over the new code confirmed/added: the 64-bit
+cpulist wrap (critical), unkillable root sampler (critical), IFS=';' leaking
+from `derive_expect` into the space-splitting cpulist utils (caught by direct
+unit test first — every list-consuming function now sets `local IFS=' '`),
+stock-baseline visits must be verified as strictly as super variants (a
+half-reverted A visit skews every delta in its block), kernel prints
+`default_smp_affinity` zero-padded to nr_cpu_ids width (`%04x`, not `%x` —
+masks < 0x1000 would false-fail), the scope test must replicate the helper's
+conf trust gate or a mis-permissioned conf makes test and helper disagree,
+and stray exported `SPS_*` env vars must be unset before sourcing the conf in
+tests (sudo's env_reset makes the helper immune; tests aren't).

@@ -1,0 +1,815 @@
+#!/bin/bash
+
+# power-mode-ab-test.sh — comparative power/efficiency/lag measurement for
+# omarchy-super-power-saver consolidation variants vs stock modes.
+#
+# The question under test (Jack, 2026-07-08): does confining userspace to
+# fewer/slower cores actually save power, or does race-to-idle win — and can
+# the mode's lag be fixed (cpu0 in the pin set) at negligible power cost?
+#
+# Usage:
+#   power-mode-ab-test.sh smoke            # ~3 min: apply/assert/revert every
+#                                          #   variant + malformed-conf fallback
+#   power-mode-ab-test.sh quick  [outdir]  # ~40 min unattended ON BATTERY
+#   power-mode-ab-test.sh thorough [outdir]# ~3 h unattended ON BATTERY
+#   power-mode-ab-test.sh analyze <outdir> # recompute stats from raw CSVs
+#
+# Launch from YOUR terminal (it prompts sudo once, then keeps the timestamp
+# alive): conf-variant writes to /etc and the RAPL energy sampler need root;
+# the mode toggles themselves don't. After the start notification, DO NOT
+# touch the laptop, plug AC, or wake the screen until the done notification.
+#
+# Methodology (see docs/design-notes.md in the repo for the full rationale):
+#  - battery power = current_now*voltage_now (BAT0 has no power_now); the EC
+#    smooths readings, so within-visit samples are ~1 effective observation —
+#    ALL inference is on per-visit medians.
+#  - idle visits are baseline-bracketed: A(stock power-saver) -> shuffled test
+#    variants -> A again; each variant is scored as delta vs the linear
+#    interpolation of the bracketing A medians (cancels SoC/thermal drift).
+#  - fixed-WORK loads (xz of a byte-identical tmpfs file), never fixed-time:
+#    total joules over [start, back-to-idle] IS joules-per-work, which gives
+#    race-to-idle fair credit for its sleep tail.
+#  - responsiveness proxies run as ordinary user-session processes so they
+#    inherit each variant's cgroup confinement exactly like real apps.
+
+set -u
+LC_ALL=C
+LANG=C
+
+TIER="${1:-}"
+case $TIER in smoke | quick | thorough | analyze) ;; *)
+  sed -n '/^# Usage:/,/^# touch the laptop/p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+  ;;
+esac
+
+B=/sys/class/power_supply/BAT0
+DGPU=/sys/bus/pci/devices/0000:01:00.0
+RAPL_MSR=/sys/class/powercap/intel-rapl:0
+RAPL_MMIO=/sys/class/powercap/intel-rapl-mmio:0
+SPS="$HOME/.local/bin/omarchy-super-power-saver"
+STATE_FILE="$HOME/.local/state/omarchy-super-power-saver/state"
+RUN_STATE=/run/omarchy-super-power-saver.state
+CONF=/etc/omarchy-super-power-saver.conf
+RESULTS_DIR="$HOME/omarchy-super-power-saver/test/results"
+OUT="${2:-$RESULTS_DIR/ab-$(date +%Y%m%d-%H%M)}"
+CSV="$OUT/samples.csv"
+RAPL_CSV="$OUT/rapl.csv"
+BENCH_CSV="$OUT/bench.csv"
+EVENTS="$OUT/events.csv"
+META="$OUT/meta.txt"
+LOG="$OUT/log"
+WORK_FILE=/tmp/sps-ab-work.bin
+
+# Timers that could fire mid-run and contaminate exactly one variant's window;
+# active ones are stopped for the whole run (fairness: super pauses snapper
+# anyway — stock variants must not be penalized by it) and restarted at exit.
+TIMER_CANDIDATES="snapper-timeline.timer snapper-cleanup.timer plocate-updatedb.timer man-db.timer shadow.timer systemd-tmpfiles-clean.timer archlinux-keyring-wkd-sync.timer fwupd-refresh.timer pacman-filesdb-refresh.timer atop-rotate.timer logrotate.timer"
+
+# ---------------------------------------------------------------- variants
+# name|kind|conf-fragment(;-separated)   kind: stock -> fragment = ppd profile
+# Expected topology per super variant is derived from the fragment with the
+# same cpulist code the helper uses.
+V_A="A|stock|power-saver"
+V_B="B|super|SPS_ONLINE_CPUS=0-15;SPS_ALLOWED_CPUS=;SPS_IRQ_STEER=0"
+V_B2="B2|super|SPS_ONLINE_CPUS=0-15;SPS_ALLOWED_CPUS=14-15;SPS_IRQ_STEER=1"
+V_C="C|super|"
+V_D="D|super|SPS_ALLOWED_CPUS=0,14-15"
+V_E="E|super|SPS_ONLINE_CPUS=0,6-7,14-15;SPS_ALLOWED_CPUS=0,6-7,14-15;SPS_IRQ_STEER=1"
+V_F="F|super|SPS_CPUIDLE_GOV=teo"
+V_BAL="BAL|stock|balanced"
+V_PERF="PERF|stock|performance"
+
+case $TIER in
+quick)
+  IDLE_VARIANTS=("$V_B" "$V_C" "$V_D")
+  W1_VARIANTS=("$V_B" "$V_C" "$V_D")
+  BLOCKS=1 SOC_FLOOR=40
+  ;;
+thorough)
+  IDLE_VARIANTS=("$V_B" "$V_B2" "$V_C" "$V_D" "$V_E" "$V_F")
+  W1_VARIANTS=("$V_A" "$V_B" "$V_C" "$V_D")
+  BLOCKS=3 SOC_FLOOR=75
+  ;;
+esac
+
+# ------------------------------------------------- cpulist utils (= helper's)
+expand_cpulist() {
+  local out=() part a b i IFS=,
+  for part in $1; do
+    if [[ $part =~ ^([0-9]{1,2})-([0-9]{1,2})$ ]]; then # {1,2}: 64-bit wrap on huge numbers would bypass the <=15 bound
+      a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]}))
+      ((a <= b && b <= 15)) || return 1
+      for ((i = a; i <= b; i++)); do out+=("$i"); done
+    elif [[ $part =~ ^[0-9]{1,2}$ ]] && ((10#$part <= 15)); then
+      out+=("$((10#$part))")
+    else
+      return 1
+    fi
+  done
+  ((${#out[@]})) || return 1
+  printf '%s\n' "${out[@]}" | sort -nu | tr '\n' ' '
+}
+compress_cpulist() {
+  local IFS=" " # callers may have IFS overridden (e.g. splitting conf fragments)
+  local out="" start="" prev="" c
+  for c in $1; do
+    if [[ -n $start ]] && ((c == prev + 1)); then
+      prev=$c
+      continue
+    fi
+    [[ -n $start ]] && { ((prev > start)) && out+="${out:+,}$start-$prev" || out+="${out:+,}$start"; }
+    start=$c prev=$c
+  done
+  [[ -n $start ]] && { ((prev > start)) && out+="${out:+,}$start-$prev" || out+="${out:+,}$start"; }
+  echo "$out"
+}
+mask_of_cpulist() {
+  local IFS=" "
+  local m=0 c
+  for c in $1; do ((m |= 1 << c)); done
+  printf '%04x\n' "$m" # kernel prints masks padded to nr_cpu_ids width (16 cpus = 4 hex digits)
+}
+
+# Derive expected topology from a super variant's conf fragment (defaults =
+# the helper's shipped defaults). Sets EXP_ONLINE, EXP_PIN, EXP_MASK, EXP_STEER.
+derive_expect() { # conf-fragment
+  EXP_ONLINE="0,14-15" EXP_PIN="14-15" EXP_STEER=1
+  local kv k v
+  local IFS=';'
+  for kv in $1; do
+    k=${kv%%=*} v=${kv#*=}
+    case $k in
+    SPS_ONLINE_CPUS) EXP_ONLINE=$(compress_cpulist "$(expand_cpulist "$v")") ;;
+    SPS_ALLOWED_CPUS) [[ -z $v ]] && EXP_PIN="" || EXP_PIN=$(compress_cpulist "$(expand_cpulist "$v")") ;;
+    SPS_IRQ_STEER) EXP_STEER=$v ;;
+    esac
+  done
+  local irq_cpus=${EXP_PIN:-$EXP_ONLINE}
+  EXP_MASK=$(mask_of_cpulist "$(expand_cpulist "$irq_cpus")")
+}
+
+# ------------------------------------------------------------------ plumbing
+log() { echo "$(date +%T) $*" >>"$LOG"; }
+note() { echo "$*" | tee -a "$LOG"; } # pre-redirect chatter
+
+FAIL=0
+chk() { # condition-result description
+  if [[ $1 == 0 ]]; then
+    note "  ok   $2"
+  else
+    note "  FAIL $2"
+    FAIL=1
+  fi
+}
+
+VISIT=0 # global visit counter (distinguishes the two A visits per block)
+
+sample_row() { # variant block phase -> exit 1 if AC plugged
+  local v i st cap dg w
+  v=$(<"$B/voltage_now") i=$(<"$B/current_now") st=$(<"$B/status") cap=$(<"$B/capacity")
+  dg=$(<"$DGPU/power/runtime_status")
+  w=$(awk -v v="$v" -v i="$i" 'BEGIN{printf "%.3f", (v<0?-v:v)*(i<0?-i:i)/1e12}')
+  echo "$1,$2,$VISIT,$3,$(date +%s.%N),$v,$i,$w,$cap,$st,$dg" >>"$CSV"
+  [[ $st == Discharging ]]
+}
+
+sample_loop() { # variant block phase count
+  local n
+  for ((n = 0; n < $4; n++)); do
+    sample_row "$1" "$2" "$3" || {
+      log "ABORT: AC plugged during $1/$3"
+      return 1
+    }
+    sleep 2
+  done
+}
+
+event() { echo "$1,$2,$3,$(date +%s.%N)" >>"$EVENTS"; } # variant block event
+
+snapshot_meta() { # label
+  {
+    echo "--- $1 visit=$VISIT $(date +%T)"
+    echo "profile=$(powerprofilesctl get 2>/dev/null) platform=$(cat /sys/firmware/acpi/platform_profile 2>/dev/null)"
+    echo "epp=$(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null)"
+    echo "online=$(cat /sys/devices/system/cpu/online) user_cpuset='$(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null)'"
+    echo "irq_default=$(cat /proc/irq/default_smp_affinity 2>/dev/null) cpuidle=$(cat /sys/devices/system/cpu/cpuidle/current_governor 2>/dev/null)"
+    echo "dgpu=$(cat "$DGPU/power/runtime_status") brightness=$(cat /sys/class/backlight/intel_backlight/brightness)"
+    echo "capacity=$(cat "$B/capacity")% status=$(cat "$B/status")"
+  } >>"$META"
+}
+
+# --------------------------------------------------------- variant switching
+write_conf() { # fragment ("" = defaults-only marker conf)
+  local tmp="$OUT/conf.tmp"
+  {
+    echo "# TEMPORARY A/B-test conf written by power-mode-ab-test.sh — if you"
+    echo "# find this outside a test run, delete it (or restore conf.orig)."
+    tr ';' '\n' <<<"$1"
+  } >"$tmp"
+  sudo -n cp "$tmp" "$CONF" && sudo -n chown root:root "$CONF" && sudo -n chmod 644 "$CONF"
+}
+
+CUR_ONLINE_SET=""
+apply_variant() { # "name|kind|conf" -> sets CUR (name); returns 1 on failure
+  local name kind conf
+  IFS='|' read -r name kind conf <<<"$1"
+  CUR=$name
+  local prev_online
+  prev_online=$(cat /sys/devices/system/cpu/online)
+  if [[ $kind == stock ]]; then
+    [[ -f $STATE_FILE || -f $RUN_STATE ]] && "$SPS" off >/dev/null 2>&1
+    powerprofilesctl set "$conf" 2>/dev/null
+    # The A visits anchor every delta — a half-reverted "baseline" (off
+    # failed, cores still offline, slices still pinned) would silently skew
+    # the whole block, so the stock branch verifies as strictly as super.
+    [[ ! -f $STATE_FILE && ! -f $RUN_STATE ]] || {
+      log "ABORT: $name state files persist after off"
+      return 1
+    }
+    [[ $(cat /sys/devices/system/cpu/online) == "0-15" ]] || {
+      log "ABORT: $name online=$(cat /sys/devices/system/cpu/online) expected=0-15"
+      return 1
+    }
+    [[ -z $(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null) ]] || {
+      log "ABORT: $name user.slice still pinned after off"
+      return 1
+    }
+    [[ $(powerprofilesctl get 2>/dev/null) == "$conf" ]] || {
+      log "ABORT: $name ppd profile=$(powerprofilesctl get 2>/dev/null) expected=$conf"
+      return 1
+    }
+  else
+    [[ -f $STATE_FILE || -f $RUN_STATE ]] && "$SPS" off >/dev/null 2>&1
+    write_conf "$conf" || {
+      log "conf write failed for $name"
+      return 1
+    }
+    "$SPS" on >/dev/null 2>&1
+    derive_expect "$conf"
+    # Topology must match the conf we just wrote — anything else means the
+    # helper rejected it or a stale helper is installed; measuring a mislabeled
+    # variant is worse than not measuring.
+    [[ $(cat /sys/devices/system/cpu/online) == "$EXP_ONLINE" ]] || {
+      log "ABORT: $name online=$(cat /sys/devices/system/cpu/online) expected=$EXP_ONLINE"
+      return 1
+    }
+    [[ $(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null) == "$EXP_PIN" ]] || {
+      log "ABORT: $name user cpuset='$(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null)' expected='$EXP_PIN'"
+      return 1
+    }
+    grep -q '^root_applied=yes' "$STATE_FILE" || {
+      log "ABORT: $name root_applied != yes"
+      return 1
+    }
+  fi
+  # Settle: 60s, 90s when the online set changed (hotplug rebuilds scheduler
+  # domains and migrates IRQs; the mode script also runs its own post-apply
+  # observation). Then a cheap drift gate: two 5-sample means 20s apart must
+  # agree within 0.4W, one 30s extension if not.
+  local settle=60
+  [[ $(cat /sys/devices/system/cpu/online) != "$prev_online" ]] && settle=90
+  log "$name applied; settling ${settle}s"
+  sleep "$settle"
+  local gate
+  gate=$(
+    for _ in 1 2 3 4 5; do
+      awk -v v="$(<"$B/voltage_now")" -v i="$(<"$B/current_now")" 'BEGIN{printf "%.3f\n", v*i/1e12}'
+      sleep 2
+    done
+    sleep 10
+    for _ in 1 2 3 4 5; do
+      awk -v v="$(<"$B/voltage_now")" -v i="$(<"$B/current_now")" 'BEGIN{printf "%.3f\n", v*i/1e12}'
+      sleep 2
+    done
+  )
+  if awk 'NR<=5{a+=$1} NR>5{b+=$1} END{d=(a-b)/5; exit (d<0?-d:d)<0.4?0:1}' <<<"$gate"; then
+    :
+  else
+    log "$name still settling (>0.4W drift in gate) — +30s"
+    sleep 30
+  fi
+  return 0
+}
+
+# --------------------------------------------------------------- benchmarks
+bench() { # variant block — ~25s, runs INSIDE the variant's confinement
+  local name=$1 block=$2 i t0 t1 ms
+  event "$name" "$block" bench_start
+  # proof of confinement for the analysis
+  echo "bench cpus_allowed=$(awk '/Cpus_allowed_list/{print $2}' /proc/self/status)" >>"$META"
+  for i in $(seq 50); do
+    t0=$EPOCHREALTIME
+    bash -c ':'
+    t1=$EPOCHREALTIME
+    awk -v a="$t0" -v b="$t1" -v v="$name" -v k="$block" \
+      'BEGIN{printf "%s,%s,exec_ms,%.3f\n", v, k, (b-a)*1000}' >>"$BENCH_CSV"
+  done
+  for i in $(seq 10); do
+    t0=$EPOCHREALTIME
+    python3 -c pass
+    t1=$EPOCHREALTIME
+    awk -v a="$t0" -v b="$t1" -v v="$name" -v k="$block" \
+      'BEGIN{printf "%s,%s,pyspawn_ms,%.3f\n", v, k, (b-a)*1000}' >>"$BENCH_CSV"
+  done
+  # timer-wakeup overshoot: p50/p99 us over 3000 x 1ms sleeps (discriminates
+  # cpuidle governors and LP-E deep-C exit latency = input-handling jitter)
+  python3 - "$name" "$block" <<'PY' >>"$BENCH_CSV"
+import sys, time
+overs = []
+for _ in range(3000):
+    t0 = time.perf_counter_ns()
+    time.sleep(0.001)
+    overs.append(time.perf_counter_ns() - t0 - 1_000_000)
+overs.sort()
+v, k = sys.argv[1], sys.argv[2]
+print(f"{v},{k},wake_p50_us,{overs[len(overs)//2]/1000:.1f}")
+print(f"{v},{k},wake_p99_us,{overs[int(len(overs)*0.99)]/1000:.1f}")
+PY
+  # single-thread throughput proxy: 64MB sha256 in-process
+  for i in 1 2 3; do
+    python3 - "$name" "$block" <<'PY' >>"$BENCH_CSV"
+import sys, time, hashlib
+data = b"x" * (1 << 20)
+t0 = time.perf_counter()
+for _ in range(64):
+    hashlib.sha256(data).digest()
+print(f"{sys.argv[1]},{sys.argv[2]},st_chunk_ms,{(time.perf_counter()-t0)*1000:.1f}")
+PY
+  done
+  # compositor round-trip (Hyprland itself lives in the confined slice)
+  if command -v hyprctl >/dev/null && hyprctl version >/dev/null 2>&1; then
+    for i in $(seq 30); do
+      t0=$EPOCHREALTIME
+      hyprctl version -j >/dev/null 2>&1
+      t1=$EPOCHREALTIME
+      awk -v a="$t0" -v b="$t1" -v v="$name" -v k="$block" \
+        'BEGIN{printf "%s,%s,hypr_ms,%.3f\n", v, k, (b-a)*1000}' >>"$BENCH_CSV"
+    done
+  fi
+  event "$name" "$block" bench_end
+}
+
+# ------------------------------------------------------------------ W1 load
+w1_run() { # variant block — fixed work: xz the tmpfs file, sample through tail
+  local name=$1 block=$2 spid
+  (
+    while sample_row "$name" "$block" w1; do sleep 2; done
+  ) &
+  spid=$!
+  LOAD_PIDS+=("$spid") # so cleanup can stop it if we die mid-run
+  event "$name" "$block" w1_start
+  xz -6 -T1 <"$WORK_FILE" >/dev/null
+  event "$name" "$block" w1_end
+  sleep 30 # tail: race-to-idle gets credit for its sleep; analyze finds idle-return
+  kill "$spid" 2>/dev/null
+  wait "$spid" 2>/dev/null
+  LOAD_PIDS=()
+  # Only the background sampler sees an AC plug (its loop just stops) — the
+  # foreground must check too, or the remaining W1 variants integrate wall
+  # power into "battery joules" without complaint.
+  [[ $(<"$B/status") == Discharging ]] || {
+    log "ABORT: AC plugged during/after $name w1"
+    return 1
+  }
+  log "$name w1 done; cooldown 90s"
+  sleep 90 # thermal hygiene before the next variant
+}
+
+# ------------------------------------------------------------------- smoke
+run_smoke() {
+  note "== SMOKE: apply/assert/revert every variant (no measurement)"
+  local v name kind conf
+  for v in "$V_B" "$V_B2" "$V_C" "$V_D" "$V_E"; do
+    IFS='|' read -r name kind conf <<<"$v"
+    note "-- variant $name ($conf)"
+    write_conf "$conf" || {
+      chk 1 "$name: conf write"
+      continue
+    }
+    "$SPS" on >/dev/null 2>&1
+    derive_expect "$conf"
+    chk "$([[ $(cat /sys/devices/system/cpu/online) == "$EXP_ONLINE" ]]; echo $?)" \
+      "$name online=$EXP_ONLINE (got $(cat /sys/devices/system/cpu/online))"
+    chk "$([[ $(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null) == "$EXP_PIN" ]]; echo $?)" \
+      "$name user.slice cpuset='$EXP_PIN' (got '$(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null)')"
+    if [[ ${conf} != *SPS_IRQ_STEER=0* ]]; then
+      chk "$([[ $(cat /proc/irq/default_smp_affinity) == "$EXP_MASK" ]]; echo $?)" \
+        "$name irq mask=$EXP_MASK (got $(cat /proc/irq/default_smp_affinity))"
+    else
+      chk "$([[ $(cat /proc/irq/default_smp_affinity) == ffff ]]; echo $?)" \
+        "$name irq mask untouched (got $(cat /proc/irq/default_smp_affinity))"
+    fi
+    chk "$(grep -q '^root_applied=yes' "$STATE_FILE"; echo $?)" "$name root_applied=yes"
+    chk "$(systemctl --user is-active --quiet omarchy-super-power-saver-watch.service; echo $?)" "$name watcher active"
+    # systemd's AllowedCPUs display format, for the scope test's mid asserts:
+    note "  info: systemctl shows AllowedCPUs='$(systemctl show -p AllowedCPUs --value user.slice)'"
+    # spawned processes actually land in the confinement:
+    if [[ -n $EXP_PIN ]]; then
+      chk "$([[ $(systemd-run --user --quiet --pipe -- grep Cpus_allowed_list /proc/self/status | awk '{print $2}') == "$EXP_PIN" ]]; echo $?)" \
+        "$name spawned proc confined to $EXP_PIN"
+    fi
+    "$SPS" off >/dev/null 2>&1
+    chk "$([[ ! -f $STATE_FILE && ! -f $RUN_STATE ]]; echo $?)" "$name state files gone after off"
+    chk "$([[ $(cat /sys/devices/system/cpu/online) == 0-15 ]]; echo $?)" "$name all cpus back online"
+    chk "$([[ -z $(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null) ]]; echo $?)" "$name user.slice unpinned"
+    chk "$([[ $(cat /proc/irq/default_smp_affinity) == ffff ]]; echo $?)" "$name irq default back to ffff"
+  done
+
+  note "-- malformed conf falls back to shipped defaults"
+  write_conf "SPS_ONLINE_CPUS=banana;SPS_ALLOWED_CPUS=0-99;SPS_IRQ_STEER=2"
+  "$SPS" on >/dev/null 2>&1
+  chk "$([[ $(cat /sys/devices/system/cpu/online) == 0,14-15 ]]; echo $?)" \
+    "bad conf -> default online 0,14-15 (got $(cat /sys/devices/system/cpu/online))"
+  chk "$([[ $(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null) == 14-15 ]]; echo $?)" \
+    "bad conf -> default pin 14-15"
+  chk "$(sudo -n grep -q 'bad SPS_ONLINE_CPUS' /run/omarchy-super-power-saver.drift; echo $?)" \
+    "bad conf -> drift log has rejection lines"
+  "$SPS" off >/dev/null 2>&1
+  chk "$([[ $(cat /sys/devices/system/cpu/online) == 0-15 ]]; echo $?)" "recovered to 0-15"
+}
+
+# ----------------------------------------------------------------- analyze
+run_analyze() {
+  python3 - "$OUT" <<'PY'
+import csv, statistics as st, sys, os
+
+out = sys.argv[1]
+def rows(f, n):
+    # skip the header and anything malformed (the root RAPL sampler is killed
+    # asynchronously and can leave a partial last line)
+    p = os.path.join(out, f)
+    if not os.path.exists(p): return []
+    with open(p) as fh:
+        return [r for r in list(csv.reader(fh))[1:] if len(r) == n and all(r[:1])]
+
+meta_p = os.path.join(out, "meta.txt")
+if not os.path.exists(meta_p):
+    sys.exit("analyze: no meta.txt in %s — wrong outdir?" % out)
+tier = "quick"
+maxr = 262143328850.0
+for line in open(meta_p):
+    if line.startswith("tier="): tier = line.strip().split("=", 1)[1]
+    if line.startswith("rapl_max_range="):
+        v = line.strip().split("=", 1)[1]
+        if v: maxr = float(v)
+
+S = [dict(zip("variant block visit phase epoch volt curr watts cap status dgpu".split(), r))
+     for r in rows("samples.csv", 11)]
+for s in S:
+    s["epoch"], s["watts"] = float(s["epoch"]), float(s["watts"])
+
+def med(xs): return st.median(xs) if xs else float("nan")
+def mad(xs):
+    if len(xs) < 2: return 0.0
+    m = med(xs)
+    return med([abs(x - m) for x in xs])
+
+# ---- idle visits: per-visit median, then delta vs bracketing-A interpolation
+visits = {}   # visit -> dict
+for s in S:
+    if s["phase"] != "idle": continue
+    v = visits.setdefault(int(s["visit"]), dict(
+        variant=s["variant"], block=int(s["block"]), w=[], t=[], bad=0))
+    v["w"].append(s["watts"]); v["t"].append(s["epoch"])
+    if s["status"] != "Discharging" or s["dgpu"] != "suspended": v["bad"] += 1
+
+lines = ["# A/B power test — %s tier" % tier, ""]
+lines += ["## Idle visits", "", "| visit | block | variant | median W | MAD | n | contaminated |", "|---|---|---|---|---|---|---|"]
+for k in sorted(visits):
+    v = visits[k]
+    v["med"], v["mad"], v["mid"] = med(v["w"]), mad(v["w"]), med(v["t"])
+    lines.append("| %d | %d | %s | %.3f | %.3f | %d | %d |" %
+                 (k, v["block"], v["variant"], v["med"], v["mad"], len(v["w"]), v["bad"]))
+
+deltas = {}   # variant -> [delta per block]
+a_noise = []
+for blk in sorted({v["block"] for v in visits.values()}):
+    A = [visits[k] for k in sorted(visits) if visits[k]["block"] == blk and visits[k]["variant"] == "A"]
+    T = [visits[k] for k in sorted(visits) if visits[k]["block"] == blk and visits[k]["variant"] != "A"]
+    if len(A) < 2:
+        lines.append("\nWARN: block %d lacks bracketing A visits — deltas skipped" % blk)
+        continue
+    a0, a1 = A[0], A[-1]
+    a_noise.append(abs(a1["med"] - a0["med"]))
+    span = a1["mid"] - a0["mid"] or 1.0
+    for v in T:
+        base = a0["med"] + (a1["med"] - a0["med"]) * (v["mid"] - a0["mid"]) / span
+        deltas.setdefault(v["variant"], []).append(v["med"] - base)
+
+thr = max(0.3 if tier == "quick" else 0.2, 2 * (max(a_noise) if a_noise else 0))
+lines += ["", "## Idle delta vs stock power-saver (baseline-bracket corrected)", "",
+          "decision threshold: |delta| >= %.3f W and same sign across blocks (A-repeat noise %s)" %
+          (thr, ",".join("%.3f" % x for x in a_noise)),
+          "", "| variant | delta W per block | median | verdict |", "|---|---|---|---|"]
+for var in sorted(deltas):
+    ds = deltas[var]
+    m = med(ds)
+    same_sign = all(d < 0 for d in ds) or all(d > 0 for d in ds)
+    verdict = ("SAVES %.2f W" % -m if m < 0 else "COSTS %.2f W" % m) \
+        if same_sign and abs(m) >= thr else "no meaningful difference"
+    lines.append("| %s | %s | %+.3f | %s |" % (var, ", ".join("%+.3f" % d for d in ds), m, verdict))
+
+# ---- W1 fixed-work energy
+EV = {}
+for var, blk, ev, t in rows("events.csv", 4):
+    EV.setdefault((var, int(blk)), {})[ev] = float(t)
+R = [(float(a), b, c) for a, b, c in rows("rapl.csv", 3) if b]
+
+def rapl_j(t0, t1):
+    seg = [(t, float(m)) for t, m, _ in R if t0 <= t <= t1]
+    if len(seg) < 2: return float("nan")
+    j, prev = 0.0, seg[0][1]
+    for _, e in seg[1:]:
+        d = e - prev
+        if d < 0: d += maxr
+        j += d; prev = e
+    return j / 1e6
+
+w1 = []
+for (var, blk), ev in sorted(EV.items()):
+    if "w1_start" not in ev or "w1_end" not in ev: continue
+    t0, t1 = ev["w1_start"], ev["w1_end"]
+    idle = med([visits[k]["med"] for k in visits if visits[k]["variant"] == var]) if any(
+        visits[k]["variant"] == var for k in visits) else float("nan")
+    pts = sorted((s["epoch"], s["watts"]) for s in S
+                 if s["variant"] == var and s["phase"] == "w1" and int(s["block"]) == blk
+                 and s["status"] == "Discharging")
+    # idle-return: first post-end 10s window whose mean is within 0.3W of idle
+    tail_end = t1 + 30
+    if idle == idle:
+        win = []
+        for t, w in pts:
+            if t < t1: continue
+            win.append((t, w)); win = [(a, b) for a, b in win if a > t - 10]
+            if len(win) >= 4 and abs(sum(b for _, b in win) / len(win) - idle) <= 0.3:
+                tail_end = t; break
+    seg = [(t, w) for t, w in pts if t0 <= t <= tail_end]
+    joules = sum((seg[i + 1][0] - seg[i][0]) * (seg[i][1] + seg[i + 1][1]) / 2
+                 for i in range(len(seg) - 1)) if len(seg) > 1 else float("nan")
+    marg = joules - idle * (tail_end - t0) if idle == idle else float("nan")
+    w1.append((var, blk, t1 - t0, joules, marg, rapl_j(t0, tail_end)))
+if w1:
+    lines += ["", "## W1 fixed work (xz, byte-identical input): energy per job", "",
+              "| variant | block | wall s | battery J | marginal J | RAPL pkg J |", "|---|---|---|---|---|---|"]
+    for var, blk, wall, j, m, rj in w1:
+        lines.append("| %s | %d | %.1f | %.0f | %.0f | %.0f |" % (var, blk, wall, j, m, rj))
+
+# ---- responsiveness
+BR = {}
+for var, blk, bench, val in rows("bench.csv", 4):
+    BR.setdefault((var, bench), []).append(float(val))
+def pct(xs, p):
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, int(len(xs) * p))]
+benches = ["exec_ms", "pyspawn_ms", "st_chunk_ms", "hypr_ms", "wake_p50_us", "wake_p99_us"]
+variants = sorted({v for v, _ in BR})
+if BR:
+    lines += ["", "## Responsiveness (p50 / p95; wake rows are medians of per-run p50/p99)", "",
+              "| variant | " + " | ".join(benches) + " |", "|" + "---|" * (len(benches) + 1)]
+    P = {}
+    for var in variants:
+        cells = []
+        for b in benches:
+            xs = BR.get((var, b), [])
+            if not xs: cells.append("-"); continue
+            if b.startswith("wake"):
+                P[(var, b)] = med(xs); cells.append("%.0f" % med(xs))
+            else:
+                P[(var, b)] = pct(xs, 0.95)
+                cells.append("%.1f / %.1f" % (med(xs), pct(xs, 0.95)))
+        lines.append("| %s | %s |" % (var, " | ".join(cells)))
+    # lag budget vs A
+    if any(v == "A" for v in variants):
+        lines += ["", "## Lag budget vs stock power-saver (pass = pyspawn p95 <= 2x A, wake p99 <= 1.5x A)", ""]
+        for var in variants:
+            if var == "A": continue
+            checks = []
+            ok = True
+            for b, lim in (("pyspawn_ms", 2.0), ("wake_p99_us", 1.5)):
+                a, x = P.get(("A", b)), P.get((var, b))
+                if a and x:
+                    r = x / a
+                    checks.append("%s %.1fx" % (b, r))
+                    ok &= r <= lim
+            lines.append("- %s: %s -> %s" % (var, ", ".join(checks), "PASS" if ok else "FAIL"))
+
+# ---- recommendation
+lines += ["", "## Recommendation inputs",
+          "- winner rule: lowest idle-power variant that passes the lag budget.",
+          "- verify sign-consistency and threshold above before shipping a default."]
+report = "\n".join(lines) + "\n"
+open(os.path.join(out, "summary.md"), "w").write(report)
+print(report)
+PY
+}
+
+if [[ $TIER == analyze ]]; then
+  OUT="${2:?analyze needs an outdir}"
+  run_analyze
+  exit $?
+fi
+
+# ---------------------------------------------------------------- preflight
+mkdir -p "$OUT"
+note "== power-mode-ab-test ($TIER) -> $OUT"
+
+[[ $("$SPS" status) == off && ! -f $STATE_FILE && ! -f $RUN_STATE ]] ||
+  { note "ABORT: mode must be OFF with no state files ('$SPS' off; retry)"; exit 1; }
+
+# The installed root helper must understand the topology conf keys, or every
+# super "variant" would silently measure the same shipped default.
+grep -q SPS_ONLINE_CPUS /usr/local/bin/omarchy-super-power-saver-helper 2>/dev/null ||
+  { note "ABORT: installed helper predates SPS_ONLINE_CPUS — re-run: sudo $HOME/.local/bin/omarchy-super-power-saver-setup"; exit 1; }
+
+if [[ $TIER != smoke ]]; then
+  [[ $(cat "$B/status") == Discharging ]] || { note "ABORT: unplug AC first"; exit 1; }
+  [[ $(cat "$B/capacity") -ge $SOC_FLOOR ]] ||
+    { note "ABORT: battery $(cat "$B/capacity")% < ${SOC_FLOOR}% floor for $TIER tier"; exit 1; }
+  # pgrep without -f matches the 15-char comm only — packaged Electron apps
+  # never have comm "electron" (slack, Discord, signal-desktop...), so name
+  # the common ones and add one -f pass for anything launched via electron.
+  if [[ -z ${SPS_AB_FORCE:-} ]] &&
+    { pgrep -ia 'firefox|chromium|chrome|brave|vivaldi|slack|discord|signal-desktop|spotify|teams' >/dev/null 2>&1 ||
+      pgrep -fia 'electron' >/dev/null 2>&1; }; then
+    note "ABORT: close browsers/electron apps first (tab timers ruin idle measurements);"
+    note "       SPS_AB_FORCE=1 to override"
+    exit 1
+  fi
+fi
+
+sudo -v || { note "ABORT: sudo needed (conf writes + RAPL energy sampler)"; exit 1; }
+
+# initial state, all restore-relevant, recorded BEFORE any change
+INIT_PROFILE=$(powerprofilesctl get 2>/dev/null)
+INIT_HYPRIDLE=$(pgrep -x hypridle >/dev/null && echo yes || echo no)
+INIT_BRIGHTNESS=$(cat /sys/class/backlight/intel_backlight/brightness 2>/dev/null)
+
+# The traps are armed BEFORE the first mutation (keepalive, hypridle kill,
+# timer stops): an INT/TERM in the setup window must restore what was already
+# changed, not leak a timestamp-refreshing sudo loop and stopped timers.
+RAPL_PID="" SUDO_KEEPALIVE="" CONF_BACKED="" STOPPED_TIMERS=""
+LOAD_PIDS=()
+cleanup() {
+  local t
+  trap - EXIT INT TERM
+  "$SPS" off >/dev/null 2>&1
+  if [[ -n ${LOAD_PIDS[*]:-} ]]; then
+    # a load may be SIGSTOPped (sensor characterization) — CONT first or the
+    # TERM stays pending on a stopped process forever
+    kill -CONT "${LOAD_PIDS[@]}" 2>/dev/null
+    kill "${LOAD_PIDS[@]}" 2>/dev/null
+  fi
+  # the RAPL sampler is a ROOT process: a plain kill is EPERM. Belt: sudo
+  # kill; braces: its loop self-exits within 2s of this script's pid dying.
+  [[ -n $RAPL_PID ]] && sudo -n kill "$RAPL_PID" 2>/dev/null
+  if [[ $CONF_BACKED == yes ]]; then
+    sudo -n cp "$OUT/conf.orig" "$CONF"
+    sudo -n chmod 644 "$CONF"
+  else
+    sudo -n rm -f "$CONF"
+  fi
+  [[ -n $INIT_PROFILE ]] && powerprofilesctl set "$INIT_PROFILE" 2>/dev/null
+  for t in $STOPPED_TIMERS; do sudo -n systemctl start "$t" 2>/dev/null; done
+  if [[ $INIT_HYPRIDLE == yes ]] && ! pgrep -x hypridle >/dev/null; then
+    setsid uwsm-app -- hypridle >/dev/null 2>&1 &
+  fi
+  [[ -n $INIT_BRIGHTNESS ]] &&
+    brightnessctl -d intel_backlight set "$INIT_BRIGHTNESS" >/dev/null 2>&1
+  [[ -n $SUDO_KEEPALIVE ]] && kill "$SUDO_KEEPALIVE" 2>/dev/null
+  rm -f "$WORK_FILE" "$WORK_FILE.pool"
+  notify-send -u normal "A/B power test finished" \
+    "Settings restored. Results: $OUT/summary.md" 2>/dev/null
+  echo "restored; results in $OUT"
+}
+trap cleanup EXIT
+trap 'exit 129' INT TERM
+
+(while sleep 50; do sudo -nv 2>/dev/null || exit; done) &
+SUDO_KEEPALIVE=$!
+# hypridle listens on Wayland idle-notify (systemd-inhibit can't stop it) and
+# fires the screensaver at 150s idle — mid-run that's a massive power+redraw
+# contaminant. Killed for the whole run, restarted by the trap.
+pkill -x hypridle 2>/dev/null
+if sudo -n test -f "$CONF"; then
+  sudo -n cp "$CONF" "$OUT/conf.orig"
+  CONF_BACKED=yes
+fi
+for t in $TIMER_CANDIDATES; do
+  if systemctl is-active --quiet "$t" 2>/dev/null; then
+    sudo -n systemctl stop "$t" && STOPPED_TIMERS+="$t "
+  fi
+done
+
+{
+  echo "tier=$TIER"
+  echo "start=$(date -Is)"
+  echo "init_profile=$INIT_PROFILE hypridle=$INIT_HYPRIDLE brightness=$INIT_BRIGHTNESS"
+  echo "stopped_timers=$STOPPED_TIMERS"
+  echo "conf_backed_up=${CONF_BACKED:-no}"
+  echo "kernel=$(uname -r) capacity=$(cat "$B/capacity")%"
+  echo "charge_full=$(cat "$B/charge_full" 2>/dev/null) cycle_count=$(cat "$B/cycle_count" 2>/dev/null)"
+  echo "usb_snapshot=$(lsusb 2>/dev/null | sha256sum | cut -c1-16)"
+  echo "wifi=$(iwctl station wlan0 show 2>/dev/null | awk '/Connected network/{print $3}')"
+  echo "rapl_max_range=$(sudo -n cat $RAPL_MSR/max_energy_range_uj 2>/dev/null)"
+  echo "claude_code_note=an idle Claude Code session may be running in a terminal — constant across variants"
+} >>"$META"
+
+if [[ $TIER == smoke ]]; then
+  run_smoke
+  if [[ $FAIL == 0 ]]; then note "== SMOKE PASS"; else
+    note "== SMOKE FAIL"
+    exit 1
+  fi
+  exit 0
+fi
+
+# ------------------------------------------------------- measurement runs
+echo "variant,block,visit,phase,epoch,volt_uv,curr_ua,watts,capacity,status,dgpu" >"$CSV"
+echo "variant,block,bench,value" >"$BENCH_CSV"
+echo "variant,block,event,epoch" >"$EVENTS"
+echo "epoch,msr_uj,mmio_uj" >"$RAPL_CSV"
+
+# one long-lived ROOT sampler for RAPL energy (root-only files; per-sample
+# sudo would write an auth journal line every 2s = periodic disk wakes).
+# Self-terminating: it checks this script's pid every tick, because the
+# user-side cleanup cannot signal a root process without sudo.
+sudo -n bash -c "while kill -0 $$ 2>/dev/null; do echo \"\$(date +%s.%N),\$(cat $RAPL_MSR/energy_uj),\$(cat $RAPL_MMIO/energy_uj)\"; sleep 2; done" >>"$RAPL_CSV" &
+RAPL_PID=$!
+
+# EC sensor characterization (informational; analyze sanity-checks with it):
+# 20s quiet + 25s of 1-core load + 20s release, 4Hz current_now sampling.
+note "characterizing battery sensor (~65s)"
+{
+  echo "--- sensor characterization $(date +%T)"
+  yes >/dev/null &
+  CHAR_PID=$!
+  LOAD_PIDS+=("$CHAR_PID") # cleanup CONTs+kills it if we die while it's STOPped
+  kill -STOP "$CHAR_PID"
+  for phase in quiet load release; do
+    [[ $phase == load ]] && kill -CONT "$CHAR_PID"
+    [[ $phase == release ]] && kill -STOP "$CHAR_PID"
+    n=80
+    [[ $phase == load ]] && n=100
+    for ((s = 0; s < n; s++)); do
+      echo "char,$phase,$(date +%s.%N),$(cat "$B/current_now")"
+      sleep 0.25
+    done
+  done
+  kill -CONT "$CHAR_PID" 2>/dev/null
+  kill "$CHAR_PID" 2>/dev/null
+  LOAD_PIDS=()
+} >>"$META" 2>/dev/null
+
+# fixed-work file + xz calibration (sized so the slowest variant ~ 2 min)
+note "generating workload + calibrating xz"
+head -c $((256 * 1024 * 1024)) /dev/urandom >"$WORK_FILE.pool"
+T0=$EPOCHREALTIME
+head -c $((8 * 1024 * 1024)) "$WORK_FILE.pool" | xz -6 -T1 >/dev/null
+T1=$EPOCHREALTIME
+# target ~40s at current (mode-off) speed => ~2-3x that on the slowest variant
+W1_MB=$(awk -v a="$T0" -v b="$T1" 'BEGIN{t=(b-a); mb=int(8*40/t); if(mb<24)mb=24; if(mb>256)mb=256; print mb}')
+head -c $((W1_MB * 1024 * 1024)) "$WORK_FILE.pool" >"$WORK_FILE"
+rm -f "$WORK_FILE.pool"
+echo "w1_size_mb=$W1_MB xz_8mb_s=$(awk -v a="$T0" -v b="$T1" 'BEGIN{printf "%.1f", b-a}')" >>"$META"
+
+EST=$((BLOCKS * (2 + ${#IDLE_VARIANTS[@]}) * 4 + ${#W1_VARIANTS[@]} * 5))
+# -u normal, NOT critical: mako pins critical notifications until dismissed —
+# a popup that vanishes at an unknown time mid-run would change what PSR sees.
+notify-send -u normal -t 15000 "A/B power test started (~${EST} min)" \
+  "DON'T touch the laptop, keyboard, or AC until the done notification." 2>/dev/null
+note "measuring — hands off the machine (~${EST} min); tail -f '$LOG' from another machine if needed"
+sleep 20 # notification gone + screen static before anything is measured
+
+# From here on: NO terminal output (screen must stay static) — log file only.
+exec >>"$LOG" 2>&1
+
+kill_run() {
+  log "ABORT: $1"
+  exit 1
+}
+
+for ((blk = 1; blk <= BLOCKS; blk++)); do
+  mapfile -t shuffled < <(printf '%s\n' "${IDLE_VARIANTS[@]}" | shuf)
+  log "block $blk order: A $(for v in "${shuffled[@]}"; do printf '%s ' "${v%%|*}"; done)A"
+  for v in "$V_A" "${shuffled[@]}" "$V_A"; do
+    VISIT=$((VISIT + 1))
+    apply_variant "$v" || kill_run "apply failed for ${v%%|*}"
+    snapshot_meta "idle-visit ${v%%|*}"
+    sample_loop "$CUR" "$blk" idle 60 || kill_run "AC during idle visit"
+    bench "$CUR" "$blk"
+  done
+done
+
+log "W1 phase"
+mapfile -t w1shuffled < <(printf '%s\n' "${W1_VARIANTS[@]}" | shuf)
+for v in "${w1shuffled[@]}"; do
+  apply_variant "$v" || kill_run "apply failed for ${v%%|*} (w1)"
+  snapshot_meta "w1 ${v%%|*}"
+  w1_run "$CUR" 1 || kill_run "w1 aborted for ${v%%|*}"
+done
+
+"$SPS" off >/dev/null 2>&1
+echo "end=$(date -Is) capacity=$(cat "$B/capacity")%" >>"$META"
+run_analyze
+log "DONE"

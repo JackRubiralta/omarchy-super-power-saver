@@ -26,6 +26,94 @@ PSR_DEBUG=/sys/kernel/debug/dri/0000:00:02.0/i915_edp_psr_debug
 FAIL=0
 fail() { echo "ASSERT FAIL: $*" >&2; FAIL=1; }
 
+# --- expected consolidation topology --------------------------------------
+# Mirror of the helper's conf parsing (same defaults, same validation): the
+# mid-snapshot asserts must track /etc/omarchy-super-power-saver.conf instead
+# of hardcoding the stock 0,14-15 island, or every A/B variant "fails".
+CONF=/etc/omarchy-super-power-saver.conf
+EXP_ONLINE="0,14-15" EXP_PIN="14-15" EXP_STEER=1
+
+expand_cpulist() {
+  local out=() part a b i IFS=,
+  for part in $1; do
+    if [[ $part =~ ^([0-9]{1,2})-([0-9]{1,2})$ ]]; then # {1,2}: 64-bit wrap on huge numbers would bypass the <=15 bound
+      a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]}))
+      ((a <= b && b <= 15)) || return 1
+      for ((i = a; i <= b; i++)); do out+=("$i"); done
+    elif [[ $part =~ ^[0-9]{1,2}$ ]] && ((10#$part <= 15)); then
+      out+=("$((10#$part))")
+    else
+      return 1
+    fi
+  done
+  ((${#out[@]})) || return 1
+  printf '%s\n' "${out[@]}" | sort -nu | tr '\n' ' '
+}
+compress_cpulist() {
+  local IFS=" " # callers may have IFS overridden (e.g. splitting conf fragments)
+  local out="" start="" prev="" c
+  for c in $1; do
+    if [[ -n $start ]] && ((c == prev + 1)); then
+      prev=$c
+      continue
+    fi
+    [[ -n $start ]] && { ((prev > start)) && out+="${out:+,}$start-$prev" || out+="${out:+,}$start"; }
+    start=$c prev=$c
+  done
+  [[ -n $start ]] && { ((prev > start)) && out+="${out:+,}$start-$prev" || out+="${out:+,}$start"; }
+  echo "$out"
+}
+mask_of_cpulist() {
+  local IFS=" "
+  local m=0 c
+  for c in $1; do ((m |= 1 << c)); done
+  printf '%04x\n' "$m" # kernel prints masks padded to nr_cpu_ids width (16 cpus = 4 hex digits)
+}
+list_has() { [[ " $1 " == *" $2 "* ]]; }
+subset_of() {
+  local IFS=" "
+  local c
+  for c in $1; do list_has "$2" "$c" || return 1; done
+}
+
+# Replicate the helper's trust gate EXACTLY: it only sources a root-owned,
+# non-group/other-writable conf. A conf that fails the gate (or that this
+# unprivileged test can't read) must not shape the expectations, or the test
+# asserts a topology the helper never applied.
+conf_trusted() {
+  [[ -f $CONF && -r $CONF && $(stat -c %u "$CONF" 2>/dev/null) == 0 &&
+    -z $(find "$CONF" -maxdepth 0 -perm /022 2>/dev/null) ]]
+}
+if [[ -f $CONF ]] && ! conf_trusted; then
+  echo "NOTE: $CONF exists but is not root-owned 644-or-stricter (or unreadable) —" >&2
+  echo "      the helper ignores it; asserting SHIPPED DEFAULTS. Fix its perms if unintended." >&2
+fi
+# a stray exported SPS_* in the invoking shell must not masquerade as conf
+unset SPS_ONLINE_CPUS SPS_ALLOWED_CPUS SPS_IRQ_STEER
+if conf_trusted; then
+  # shellcheck disable=SC1090
+  . "$CONF" 2>/dev/null
+  if [[ -n ${SPS_ONLINE_CPUS:-} ]] && exp=$(expand_cpulist "$SPS_ONLINE_CPUS") &&
+    list_has "$exp" 0 && list_has "$exp" 14 && list_has "$exp" 15; then
+    EXP_ONLINE=$(compress_cpulist "$exp")
+  fi
+  if [[ -n ${SPS_ALLOWED_CPUS+x} ]]; then
+    if [[ -z ${SPS_ALLOWED_CPUS} ]]; then
+      EXP_PIN=""
+    elif exp=$(expand_cpulist "$SPS_ALLOWED_CPUS") &&
+      subset_of "$exp" "$(expand_cpulist "$EXP_ONLINE")"; then
+      EXP_PIN=$(compress_cpulist "$exp")
+    fi
+  fi
+  [[ ${SPS_IRQ_STEER:-} =~ ^[01]$ ]] && EXP_STEER=$SPS_IRQ_STEER
+fi
+EXP_IRQ_CPUS=${EXP_PIN:-$EXP_ONLINE}
+EXP_MASK=$(mask_of_cpulist "$(expand_cpulist "$EXP_IRQ_CPUS")")
+# systemd prints AllowedCPUs as space-separated ranges ("0 14-15"), the
+# kernel's cpuset files use commas ("0,14-15").
+EXP_PIN_SYSTEMD=${EXP_PIN//,/ }
+echo "expected topology: online=$EXP_ONLINE pin='$EXP_PIN' steer=$EXP_STEER mask=$EXP_MASK"
+
 # Only the psr_debug read is root-only; without passwordless sudo it samples
 # empty in ALL snapshots (still a consistent diff), so don't hard-require it.
 sudo -n true 2>/dev/null ||
@@ -142,18 +230,31 @@ expect_v() { # key expected — against the mid VOLATILE snapshot (RAPL)
   got=$(grep "^$1=" "$OUT/mid.volatile" | cut -d= -f2-)
   [[ $got == "$2" ]] || fail "mid: $1 = '$got', expected '$2'"
 }
+same_as_pre() { # key — value while mode is on must equal the pre snapshot's
+  [[ $(grep "^$1=" "$OUT/pre") == $(grep "^$1=" "$OUT/mid") ]] ||
+    fail "mid: $1 changed while mode on (expected untouched for this variant)"
+}
 watch_pl1=$(grep '^watch_pl1=' "$STATE_FILE" | cut -d= -f2)
-expect cpus_online "0,14-15"
+expect cpus_online "$EXP_ONLINE"
 expect ppd_profile "power-saver"
 expect platform_profile "quiet"
 expect_v intel-rapl:0_pl1 "${watch_pl1:-10000000}"
 expect_v intel-rapl:0_pl4 "25000000"
-expect cg_user_allowed "14-15"
-expect cg_user_cpus "14-15"
+if [[ -n $EXP_PIN ]]; then
+  expect cg_user_allowed "$EXP_PIN_SYSTEMD"
+  expect cg_user_cpus "$EXP_PIN"
+else
+  same_as_pre cg_user_allowed
+  same_as_pre cg_user_cpus
+fi
 expect snd_power_save "1"
 expect snapper_timer "inactive"
 expect thermald "inactive"
-expect irq_default_aff "c000"
+if [[ $EXP_STEER == 1 ]]; then
+  expect irq_default_aff "$EXP_MASK"
+else
+  same_as_pre irq_default_aff
+fi
 grep -q '^gt0_slpc=.*\[power_saving\]' "$OUT/mid" || fail "mid: gt0 slpc not [power_saving]"
 grep -q '^gt1_slpc=.*\[power_saving\]' "$OUT/mid" || fail "mid: gt1 slpc not [power_saving]"
 # UI must be IDENTICAL to pre while the mode is on (v4 requirement):

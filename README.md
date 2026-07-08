@@ -73,21 +73,40 @@ off with the OLD helper first (on/off must be version-paired).
 Create `/etc/omarchy-super-power-saver.conf` (must be root-owned, mode 644):
 
 ```sh
-SPS_CPUIDLE_GOV=teo     # cpuidle governor while the mode is on
-SPS_PL1_UW=7000000      # long-term power cap variant (default 10W)
-SPS_PL2_UW=10000000     # short-term cap variant (default 15W)
+SPS_CPUIDLE_GOV=teo        # cpuidle governor while the mode is on
+SPS_PL1_UW=7000000         # long-term power cap variant (default 10W)
+SPS_PL2_UW=10000000        # short-term cap variant (default 15W)
+SPS_ONLINE_CPUS=0,14-15    # CPUs kept online (must contain 0, 14, 15)
+SPS_ALLOWED_CPUS=14-15     # slice AllowedCPUs pin (subset of online; empty = no pin)
+SPS_IRQ_STEER=1            # 0 = leave IRQ affinities alone
 ```
 
-Toggle the mode off→on to apply. Measure before keeping: on the reference
-machine, *lower* CPU caps measured **worse** at fixed light work
-(race-to-idle beats forced-slow) — the defaults are the measured sweet spot.
+Toggle the mode off→on to apply — topology keys especially: `reassert`
+deliberately refuses to half-apply a changed topology (it would pin slices at
+still-offline CPUs, which *un*-confines them). Malformed values fall back to
+the shipped defaults and are logged to the drift log (`diag` shows it).
+Measure before keeping: on the reference machine, *lower* CPU caps measured
+**worse** at fixed light work (race-to-idle beats forced-slow) — the defaults
+are the measured sweet spot.
 
 ## Test
 
 ```sh
-./test/power-mode-scope-test.sh    # scope-exactness: on→off must restore ~50 knobs byte-identically
-./test/power-mode-test.sh <outdir> # battery drain protocol (idle/light/burst per mode, on battery)
+./test/power-mode-ab-test.sh smoke     # ~3 min: apply/assert/revert every consolidation variant
+./test/power-mode-ab-test.sh quick     # ~40 min on battery: stock vs consolidation ablations
+./test/power-mode-ab-test.sh thorough  # ~3 h: full variant matrix, 3 interleaved blocks
+./test/power-mode-scope-test.sh        # scope-exactness: on→off must restore ~50 knobs byte-identically
+./test/power-mode-test.sh <outdir>     # battery drain protocol (idle/light/burst per mode, on battery)
 ```
+
+`power-mode-ab-test.sh` is the empirical answer to "does fewer/slower cores
+actually save power?": baseline-bracketed randomized visits (each variant
+scored as a delta against interpolated stock-power-saver medians, canceling
+battery/thermal drift), fixed-work xz energy with race-to-idle tail credit,
+and a lag budget (process-spawn p95 ≤ 2× stock, timer-wakeup p99 ≤ 1.5×
+stock) that turns "feels laggy" into a pass/fail line. Results land in
+`test/results/` (gitignored); `analyze <outdir>` recomputes the report from
+the raw CSVs.
 
 ## Design notes
 

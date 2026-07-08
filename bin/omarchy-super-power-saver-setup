@@ -64,7 +64,11 @@ cat >"$HELPER_TMP" <<'HELPER'
 #    and fires none, and reading its sysfs irq files does not wake it.
 #  - Optional A/B knobs from /etc/omarchy-super-power-saver.conf (root-owned,
 #    not group/other-writable — it feeds this root shell; values validated):
-#    SPS_PL1_UW, SPS_PL2_UW, SPS_CPUIDLE_GOV. Toggle off->on to pick up changes.
+#    SPS_PL1_UW, SPS_PL2_UW, SPS_CPUIDLE_GOV, and the consolidation topology
+#    SPS_ONLINE_CPUS / SPS_ALLOWED_CPUS / SPS_IRQ_STEER (added 2026-07-08 for
+#    the measured A/B of "fewer slow cores vs race-to-idle").
+#    Toggle off->on to pick up changes — reassert intentionally re-reads them,
+#    but only an off->on cycle re-snapshots the baseline.
 
 set -u
 
@@ -87,12 +91,73 @@ SNAPPER_TIMER=snapper-timeline.timer
 VERB="${1:-}"
 
 # CPU topology (Core Ultra 9 285H): cpu0-5 = P, cpu6-13 = E, cpu14-15 = LP-E
-# (SoC tile). cpu0 has no online file (not hotpluggable) and stays as kernel/
-# IRQ-residue landing zone; the cgroup pin keeps userspace off it.
-LP_CPUS="14-15"
-LP_MASK=c000
-HOTPLUG_CPUS="1 2 3 4 5 6 7 8 9 10 11 12 13"
+# (SoC tile). cpu0 has no online file (not hotpluggable). Which CPUs stay
+# online / carry userspace / receive IRQs is conf-tunable (see the SPS_* keys
+# below); these are the shipped defaults. ALL_HOTPLUG is the restore-side
+# re-online set and stays FIXED: a conf edit between on and off must never
+# strand a core offline (writing 1 to an online cpu is a no-op).
+ONLINE_CPUS="0,14-15" # SPS_ONLINE_CPUS: CPUs left online while the mode is on
+PIN_CPUS="14-15"      # SPS_ALLOWED_CPUS: slice AllowedCPUs pin ("" = no pin)
+IRQ_STEER=1           # SPS_IRQ_STEER: steer IRQs + default_smp_affinity (0/1)
+ALL_HOTPLUG="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15"
 SLICES="user.slice system.slice machine.slice"
+
+# --- cpulist utilities --------------------------------------------------------
+# expand: "0,6-7,14-15" -> "0 6 7 14 15" (sorted, unique); fails on anything
+# that is not a well-formed cpulist within this machine's 16 cpus.
+expand_cpulist() {
+  local out=() part a b i IFS=,
+  for part in $1; do
+    if [[ $part =~ ^([0-9]{1,2})-([0-9]{1,2})$ ]]; then # {1,2}: 64-bit wrap on huge numbers would bypass the <=15 bound
+      a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]}))
+      ((a <= b && b <= 15)) || return 1
+      for ((i = a; i <= b; i++)); do out+=("$i"); done
+    elif [[ $part =~ ^[0-9]{1,2}$ ]] && ((10#$part <= 15)); then
+      out+=("$((10#$part))")
+    else
+      return 1
+    fi
+  done
+  ((${#out[@]})) || return 1
+  printf '%s\n' "${out[@]}" | sort -nu | tr '\n' ' '
+}
+
+# compress: "0 6 7 14 15" -> "0,6-7,14-15" (kernel-canonical, so guarded
+# writers can string-compare against sysfs/cpuset readbacks).
+compress_cpulist() {
+  local IFS=" " # callers may have IFS overridden (e.g. splitting conf fragments)
+  local out="" start="" prev="" c
+  for c in $1; do
+    if [[ -n $start ]] && ((c == prev + 1)); then
+      prev=$c
+      continue
+    fi
+    [[ -n $start ]] && { ((prev > start)) && out+="${out:+,}$start-$prev" || out+="${out:+,}$start"; }
+    start=$c prev=$c
+  done
+  [[ -n $start ]] && { ((prev > start)) && out+="${out:+,}$start-$prev" || out+="${out:+,}$start"; }
+  echo "$out"
+}
+
+mask_of_cpulist() { # expanded list -> hex bitmask, kernel print style
+  local IFS=" "
+  local m=0 c
+  for c in $1; do ((m |= 1 << c)); done
+  printf '%04x\n' "$m" # kernel prints masks padded to nr_cpu_ids width (16 cpus = 4 hex digits)
+}
+
+list_has() { [[ " $1 " == *" $2 "* ]]; }
+subset_of() {
+  local IFS=" "
+  local c
+  for c in $1; do list_has "$2" "$c" || return 1; done
+}
+
+# Conf-problem logger: once per unique message — the conf is parsed on EVERY
+# verb, and a persistently bad conf must not grow the drift log unboundedly.
+conf_err() {
+  grep -qF "$1" "$DRIFT_LOG" 2>/dev/null || echo "$(date +%s) $1" >>"$DRIFT_LOG"
+}
 
 PL1=10000000        # 10W long-term
 PL1_TAU=8000000     # 8s window (default ~28-56s made bursts converge slowly)
@@ -102,7 +167,9 @@ CPUIDLE_GOV=""      # empty = leave governor alone
 
 # Optional A/B overrides. Only sourced when root-owned and not writable by
 # group/other — this file is executed by a NOPASSWD-sudo root shell. Values
-# are validated: only positive integers may reach a power-limit write.
+# are validated: only positive integers may reach a power-limit write, and
+# only well-formed cpulists may reshape the consolidation (a malformed set
+# falls back to the shipped default and leaves a drift-log line for diag).
 if [[ -f $CONF && $(stat -c %u "$CONF" 2>/dev/null) == 0 &&
       -z $(find "$CONF" -maxdepth 0 -perm /022 2>/dev/null) ]]; then
   # shellcheck disable=SC1090
@@ -110,7 +177,55 @@ if [[ -f $CONF && $(stat -c %u "$CONF" 2>/dev/null) == 0 &&
   [[ ${SPS_PL1_UW:-} =~ ^[0-9]+$ && ${SPS_PL1_UW:-0} -gt 0 ]] && PL1=$SPS_PL1_UW
   [[ ${SPS_PL2_UW:-} =~ ^[0-9]+$ && ${SPS_PL2_UW:-0} -gt 0 ]] && PL2=$SPS_PL2_UW
   CPUIDLE_GOV=${SPS_CPUIDLE_GOV:-}
+  # Online set: must contain cpu0 (not hotpluggable — an online set without it
+  # is a lie) and the LP-E pair 14-15 (the SoC-tile cores every variant keeps).
+  if [[ -n ${SPS_ONLINE_CPUS:-} ]]; then
+    if _exp=$(expand_cpulist "$SPS_ONLINE_CPUS") &&
+      list_has "$_exp" 0 && list_has "$_exp" 14 && list_has "$_exp" 15; then
+      ONLINE_CPUS=$(compress_cpulist "$_exp")
+    else
+      conf_err "conf: bad SPS_ONLINE_CPUS='${SPS_ONLINE_CPUS}' — using $ONLINE_CPUS"
+    fi
+  fi
+  # Pin set: explicitly-empty means "no cgroup pin"; otherwise must be a
+  # subset of the online set (pinning to an offline cpu = empty cpuset).
+  if [[ -n ${SPS_ALLOWED_CPUS+x} ]]; then
+    if [[ -z $SPS_ALLOWED_CPUS ]]; then
+      PIN_CPUS=""
+    elif _exp=$(expand_cpulist "$SPS_ALLOWED_CPUS") &&
+      subset_of "$_exp" "$(expand_cpulist "$ONLINE_CPUS")"; then
+      PIN_CPUS=$(compress_cpulist "$_exp")
+    else
+      conf_err "conf: bad SPS_ALLOWED_CPUS='${SPS_ALLOWED_CPUS}' — using $PIN_CPUS"
+    fi
+  fi
+  if [[ -n ${SPS_IRQ_STEER:-} ]]; then
+    if [[ $SPS_IRQ_STEER =~ ^[01]$ ]]; then
+      IRQ_STEER=$SPS_IRQ_STEER
+    else
+      conf_err "conf: bad SPS_IRQ_STEER='${SPS_IRQ_STEER}' — using $IRQ_STEER"
+    fi
+  fi
+  unset _exp
 fi
+
+# Derived consolidation sets. OFFLINE_CPUS = hotpluggable cpus not in the
+# online set; IRQ target = the pin set (userspace and IRQs on the same island)
+# or the whole online set when unpinned. Defense-in-depth: if ONLINE_CPUS is
+# somehow unparseable here, an empty _online_exp would put EVERY cpu in the
+# offline set (including 14-15) — revert to shipped defaults instead.
+if ! _online_exp=$(expand_cpulist "$ONLINE_CPUS"); then
+  conf_err "internal: ONLINE_CPUS='$ONLINE_CPUS' unparseable — shipped defaults"
+  ONLINE_CPUS="0,14-15" PIN_CPUS="14-15" IRQ_STEER=1
+  _online_exp=$(expand_cpulist "$ONLINE_CPUS")
+fi
+OFFLINE_CPUS=""
+for _c in $ALL_HOTPLUG; do
+  list_has "$_online_exp" "$_c" || OFFLINE_CPUS+="$_c "
+done
+IRQ_CPUS=${PIN_CPUS:-$ONLINE_CPUS}
+IRQ_MASK=$(mask_of_cpulist "$(expand_cpulist "$IRQ_CPUS")")
+unset _online_exp _c
 
 # Serialize on/off/reassert/diag. Bounded wait: one wedged call must not make
 # every later invocation hang silently; callers see exit 75 and may retry.
@@ -358,13 +473,38 @@ gpu_restore() {
 }
 
 cgroup_apply() {
-  # Pin userspace to the LP-E island. One set-property call per slice
+  # Pin userspace to the consolidation island. One set-property call per slice
   # (systemctl set-property takes a single unit). Drift-guarded via the live
-  # cgroup file so reassert doesn't spam systemd.
-  local s
+  # cgroup file so reassert doesn't spam systemd — PIN_CPUS is canonicalized
+  # at conf-parse time, so a plain string compare against the kernel's
+  # canonical cpuset print is exact. Empty pin set = variant without cgroup
+  # confinement: nothing to do (restore unpins unconditionally regardless).
+  [[ -n $PIN_CPUS ]] || return 0
+  # A conf edited between on and reassert can point the pin at CPUs that are
+  # still offline; cgroup v2 then falls back to the parent's effective set,
+  # silently UNCONFINING userspace — worse than either topology. Topology
+  # changes require an off->on cycle: skip the pin and log instead.
+  local online_now c any=0
+  online_now=$(expand_cpulist "$(cat /sys/devices/system/cpu/online 2>/dev/null)") || online_now=""
+  for c in $(expand_cpulist "$PIN_CPUS"); do
+    list_has "$online_now" "$c" && { any=1; break; }
+  done
+  ((any)) || {
+    conf_err "cgroup pin skipped: no cpu of '$PIN_CPUS' online (conf edited while on? toggle off->on)"
+    return 0
+  }
+  local s cur
   for s in $SLICES; do
-    [[ $(cat "/sys/fs/cgroup/$s/cpuset.cpus" 2>/dev/null) == "$LP_CPUS" ]] ||
-      timeout -k 5 25 systemctl set-property --runtime "$s" "AllowedCPUs=$LP_CPUS" 2>/dev/null
+    cur=$(cat "/sys/fs/cgroup/$s/cpuset.cpus" 2>/dev/null)
+    if [[ -z $cur && ! -d /sys/fs/cgroup/$s ]]; then
+      # Inactive slice (machine.slice without VMs) has no cgroup file — ask
+      # systemd instead, or every reassert re-issues set-property. systemd
+      # prints ranges space-separated; normalize to the kernel's comma form.
+      cur=$(timeout 25 systemctl show -p AllowedCPUs --value "$s" 2>/dev/null)
+      cur=${cur// /,}
+    fi
+    [[ $cur == "$PIN_CPUS" ]] ||
+      timeout -k 5 25 systemctl set-property --runtime "$s" "AllowedCPUs=$PIN_CPUS" 2>/dev/null
   done
 }
 
@@ -393,18 +533,20 @@ cgroup_restore() {
 }
 
 irq_steer() {
-  # Steer device IRQs to the LP-E island BEFORE offlining, so hotplug has no
-  # IRQ churn to do (kernel migrates offlined CPUs' IRQs within affinity &
-  # online). default_smp_affinity makes IRQs allocated later land there too.
-  # Managed IRQs (nvme queues) reject with EIO — by design, skip silently.
-  # dGPU IRQs are never touched (device suspended, fires none).
-  w "$LP_MASK" /proc/irq/default_smp_affinity
+  # Steer device IRQs to the consolidation island BEFORE offlining, so hotplug
+  # has no IRQ churn to do (kernel migrates offlined CPUs' IRQs within
+  # affinity & online). default_smp_affinity makes IRQs allocated later land
+  # there too. Managed IRQs (nvme queues) reject with EIO — by design, skip
+  # silently. dGPU IRQs are never touched (device suspended, fires none).
+  # SPS_IRQ_STEER=0 disables steering entirely (ablation variant).
+  [[ $IRQ_STEER == 1 ]] || return 0
+  w "$IRQ_MASK" /proc/irq/default_smp_affinity
   local skip i
   skip=" $(dgpu_irqs) "
   for i in /proc/irq/[0-9]*; do
     [[ $skip == *" $(basename "$i") "* ]] && continue
-    [[ $(cat "$i/smp_affinity_list" 2>/dev/null) == "$LP_CPUS" ]] && continue
-    echo "$LP_CPUS" >"$i/smp_affinity_list" 2>/dev/null
+    [[ $(cat "$i/smp_affinity_list" 2>/dev/null) == "$IRQ_CPUS" ]] && continue
+    echo "$IRQ_CPUS" >"$i/smp_affinity_list" 2>/dev/null
   done
 }
 
@@ -493,10 +635,11 @@ apply_knobs() {
   cgroup_apply
   irq_steer
 
-  # Offline P-cores 1-5 + E-cores 6-13. cpu0 stays (lone P-core, not
-  # hotpluggable); cpu14-15 (LP-E) carry the session.
+  # Offline everything outside the conf'd online set (stock: P-cores 1-5 +
+  # E-cores 6-13, leaving cpu0 + the LP-E pair). cpu0 is never in this set
+  # (not hotpluggable); validation keeps 14-15 out of it too.
   local c
-  for c in $HOTPLUG_CPUS; do wv 0 "/sys/devices/system/cpu/cpu$c/online"; done
+  for c in $OFFLINE_CPUS; do wv 0 "/sys/devices/system/cpu/cpu$c/online"; done
 
   w 0 /proc/sys/kernel/nmi_watchdog
   w 6000 /proc/sys/vm/dirty_writeback_centisecs
@@ -563,14 +706,16 @@ restore() {
   # cpu0 rejoins the effective cpuset immediately.
   cgroup_restore
 
-  # Unconditional re-online (a 1 write to an online cpu is a no-op; also heals
-  # a v3-era state that only offlined 1-5). Verified + once-retried: a cpu
-  # stuck offline is a real leak and must survive into the drift log. MUST
-  # precede the IRQ restore: saved masks referencing still-offline CPUs would
-  # be EINVAL'd, and the kernel revives managed nvme queues on re-online
-  # before the sweep walks /proc/irq.
+  # Unconditional re-online of EVERY hotpluggable cpu — deliberately NOT the
+  # conf-derived offline set: a conf edit between on and off must never strand
+  # a core (a 1 write to an online cpu is a no-op; also heals a v3-era state
+  # that only offlined 1-5). Verified + once-retried: a cpu stuck offline is a
+  # real leak and must survive into the drift log. MUST precede the IRQ
+  # restore: saved masks referencing still-offline CPUs would be EINVAL'd,
+  # and the kernel revives managed nvme queues on re-online before the sweep
+  # walks /proc/irq.
   local c
-  for c in $HOTPLUG_CPUS; do
+  for c in $ALL_HOTPLUG; do
     wv 1 "/sys/devices/system/cpu/cpu$c/online" || {
       sleep 0.2
       wv 1 "/sys/devices/system/cpu/cpu$c/online" || RESTORE_WARN+=" cpu$c-stuck-offline"
@@ -688,8 +833,13 @@ restore() {
 
   # Drift log: normally removed with the state; kept (with a summary line)
   # when the restore itself hit trouble, so diag has evidence after the fact.
+  # Conf-rejection lines also survive a clean off — the off after a variant
+  # misbehaved is exactly when the user runs diag to ask why.
   if [[ -n $RESTORE_WARN ]]; then
     echo "$(date +%s) restore warnings:$RESTORE_WARN" >>"$DRIFT_LOG"
+  elif grep -qE ' (conf|internal|cgroup pin skipped):' "$DRIFT_LOG" 2>/dev/null; then
+    grep -E ' (conf|internal|cgroup pin skipped):' "$DRIFT_LOG" | tail -5 >"$DRIFT_LOG.tmp" &&
+      mv "$DRIFT_LOG.tmp" "$DRIFT_LOG"
   else
     rm -f "$DRIFT_LOG"
   fi
@@ -726,10 +876,11 @@ diag() {
   echo "--- RAPL (PL1/tau/PL2/PL4) MSR: $(cat $RAPL_MSR/constraint_0_power_limit_uw 2>/dev/null)/$(cat $RAPL_MSR/constraint_0_time_window_us 2>/dev/null)/$(cat $RAPL_MSR/constraint_1_power_limit_uw 2>/dev/null)/$(cat $RAPL_MSR/constraint_2_power_limit_uw 2>/dev/null)  MMIO: $(cat $RAPL_MMIO/constraint_0_power_limit_uw 2>/dev/null)/$(cat $RAPL_MMIO/constraint_0_time_window_us 2>/dev/null)/$(cat $RAPL_MMIO/constraint_1_power_limit_uw 2>/dev/null)/$(cat $RAPL_MMIO/constraint_2_power_limit_uw 2>/dev/null)"
   echo "--- GT freqs: gt0 cur/act/max=$(cat $GPU/gt/gt0/rps_cur_freq_mhz 2>/dev/null)/$(cat $GPU/gt/gt0/rps_act_freq_mhz 2>/dev/null)/$(cat $GPU/gt/gt0/rps_max_freq_mhz 2>/dev/null)  gt1=$(cat $GPU/gt/gt1/rps_cur_freq_mhz 2>/dev/null)/$(cat $GPU/gt/gt1/rps_act_freq_mhz 2>/dev/null)/$(cat $GPU/gt/gt1/rps_max_freq_mhz 2>/dev/null)  slpc gt0/gt1: $(slpc_token $GPU/gt/gt0)/$(slpc_token $GPU/gt/gt1)"
   echo "--- CPUs online: $(cat /sys/devices/system/cpu/online)  uncore max: $(cat $UNCORE/max_freq_khz 2>/dev/null)  ASPM: $(grep -o '\[.*\]' $ASPM)  cpuidle: $(cat $CPUIDLE 2>/dev/null)"
+  echo "--- conf topology: online=$ONLINE_CPUS pin='${PIN_CPUS}' irq_steer=$IRQ_STEER irq_target=$IRQ_CPUS mask=$IRQ_MASK"
   local total lp
   total=$(ls -d /proc/irq/[0-9]* 2>/dev/null | wc -l)
-  lp=$(grep -lx "$LP_CPUS" /proc/irq/[0-9]*/smp_affinity_list 2>/dev/null | wc -l)
-  echo "--- IRQs on $LP_CPUS: $lp/$total  default_smp_affinity: $(cat /proc/irq/default_smp_affinity 2>/dev/null)"
+  lp=$(grep -lx "$IRQ_CPUS" /proc/irq/[0-9]*/smp_affinity_list 2>/dev/null | wc -l)
+  echo "--- IRQs on $IRQ_CPUS: $lp/$total  default_smp_affinity: $(cat /proc/irq/default_smp_affinity 2>/dev/null)"
   echo "--- slices AllowedCPUs: user='$(timeout 25 systemctl show -p AllowedCPUs --value user.slice 2>/dev/null)' system='$(timeout 25 systemctl show -p AllowedCPUs --value system.slice 2>/dev/null)' machine='$(timeout 25 systemctl show -p AllowedCPUs --value machine.slice 2>/dev/null)'  user effective: $(cat /sys/fs/cgroup/user.slice/cpuset.cpus.effective 2>/dev/null)"
   echo "--- snd_hda power_save: $(cat $SND 2>/dev/null)  snapper-timeline: $(timeout 25 systemctl is-active $SNAPPER_TIMER 2>/dev/null)  thermald: $(timeout 25 systemctl is-active thermald.service 2>/dev/null)"
   if [[ -f $DRIFT_LOG ]]; then
@@ -862,4 +1013,7 @@ echo "Optional A/B knobs (create /etc/omarchy-super-power-saver.conf, root:root 
 echo "  SPS_CPUIDLE_GOV=teo        # cpuidle governor while mode is on"
 echo "  SPS_PL1_UW=7000000         # PL1 variant (default 10000000)"
 echo "  SPS_PL2_UW=10000000        # PL2 variant (default 15000000)"
+echo "  SPS_ONLINE_CPUS=0,14-15    # CPUs kept online (must contain 0,14,15)"
+echo "  SPS_ALLOWED_CPUS=14-15     # slice AllowedCPUs pin (subset of online; empty = no pin)"
+echo "  SPS_IRQ_STEER=1            # 0 = leave IRQ affinities alone"
 echo "Toggle the mode off->on after editing the conf."
