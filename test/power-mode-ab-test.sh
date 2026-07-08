@@ -11,6 +11,11 @@
 #   power-mode-ab-test.sh smoke            # ~3 min: apply/assert/revert every
 #                                          #   variant + malformed-conf fallback
 #   power-mode-ab-test.sh quick  [outdir]  # ~40 min unattended ON BATTERY
+#   power-mode-ab-test.sh media  [outdir]  # ~50 min ON BATTERY: hw video
+#                                          #   playback + bursty-interactive
+#                                          #   round over D / E / B (real-use
+#                                          #   proxy: the "watching YouTube"
+#                                          #   question)
 #   power-mode-ab-test.sh thorough [outdir]# ~3 h unattended ON BATTERY
 #   power-mode-ab-test.sh analyze <outdir> # recompute stats from raw CSVs
 #
@@ -37,7 +42,7 @@ LC_ALL=C
 LANG=C
 
 TIER="${1:-}"
-case $TIER in smoke | quick | thorough | analyze) ;; *)
+case $TIER in smoke | quick | media | thorough | analyze) ;; *)
   sed -n '/^# Usage:/,/^# touch the laptop/p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
   ;;
@@ -60,6 +65,7 @@ EVENTS="$OUT/events.csv"
 META="$OUT/meta.txt"
 LOG="$OUT/log"
 WORK_FILE=/tmp/sps-ab-work.bin
+VIDEO_FILE=/tmp/sps-ab-video.mp4
 
 # Timers that could fire mid-run and contaminate exactly one variant's window;
 # active ones are stopped for the whole run (fairness: super pauses snapper
@@ -85,6 +91,14 @@ quick)
   IDLE_VARIANTS=("$V_B" "$V_C" "$V_D")
   W1_VARIANTS=("$V_B" "$V_C" "$V_D")
   BLOCKS=1 SOC_FLOOR=40
+  ;;
+media)
+  # Real-use round: which topology is cheapest for fixed-RATE work (hw-decoded
+  # video = the YouTube proxy, where mean W IS joules-per-work) and for bursty
+  # interactive work, and does the E-core-pair variant buy smoothness?
+  IDLE_VARIANTS=("$V_D" "$V_E" "$V_B")
+  W1_VARIANTS=()
+  BLOCKS=1 SOC_FLOOR=45
   ;;
 thorough)
   IDLE_VARIANTS=("$V_B" "$V_B2" "$V_C" "$V_D" "$V_E" "$V_F")
@@ -376,6 +390,95 @@ w1_run() { # variant block — fixed work: xz the tmpfs file, sample through tai
   sleep 90 # thermal hygiene before the next variant
 }
 
+# --------------------------------------------------------------- W2 bursty
+# The interactive-use proxy: a fixed chunk of work every 5s for 150s. A fast
+# variant races each chunk and sleeps; a slow one grinds. Total work is fixed,
+# so mean W over the window compares fairly, and per-chunk latency doubles as
+# a responsiveness-under-load metric.
+w2_run() { # variant block
+  local name=$1 block=$2 spid
+  (
+    while sample_row "$name" "$block" w2; do sleep 2; done
+  ) &
+  spid=$!
+  LOAD_PIDS+=("$spid")
+  event "$name" "$block" w2_start
+  python3 - "$name" "$block" <<'PY' >>"$BENCH_CSV"
+import sys, time, hashlib
+data = b"x" * (1 << 20)
+lat = []
+for _ in range(30):                       # 30 cycles x 5s = 150s
+    t0 = time.perf_counter()
+    for _ in range(60):                   # fixed work per cycle: 60 x 1MB sha256
+        hashlib.sha256(data).digest()
+    dt = time.perf_counter() - t0
+    lat.append(dt)
+    time.sleep(max(0.0, 5.0 - dt))
+lat.sort()
+v, k = sys.argv[1], sys.argv[2]
+print(f"{v},{k},w2_chunk_p50_ms,{lat[len(lat)//2]*1000:.1f}")
+print(f"{v},{k},w2_chunk_p95_ms,{lat[int(len(lat)*0.95)]*1000:.1f}")
+PY
+  event "$name" "$block" w2_end
+  kill "$spid" 2>/dev/null
+  wait "$spid" 2>/dev/null
+  LOAD_PIDS=()
+  [[ $(<"$B/status") == Discharging ]] || {
+    log "ABORT: AC plugged during $name w2"
+    return 1
+  }
+}
+
+# ---------------------------------------------------------------- W3 video
+# Fixed-rate work: hw-decoded 1080p30 playback (the "watching YouTube" proxy —
+# same decoder/compositor/wakeup pattern, minus the browser). Mean W over the
+# window IS energy-per-second-of-video; dropped frames = playback smoothness.
+w3_run() { # variant block
+  local name=$1 block=$2 mpid spid drops
+  mpv --hwdec=auto-safe --loop=inf --mute=yes --really-quiet \
+    --input-ipc-server="$OUT/mpv-ipc.sock" "$VIDEO_FILE" >/dev/null 2>&1 &
+  mpid=$!
+  LOAD_PIDS+=("$mpid")
+  sleep 20 # decoder pipeline + renderer settle before measuring
+  (
+    while sample_row "$name" "$block" w3; do sleep 2; done
+  ) &
+  spid=$!
+  LOAD_PIDS+=("$spid")
+  event "$name" "$block" w3_start
+  sleep 150
+  event "$name" "$block" w3_end
+  drops=$(python3 - "$OUT/mpv-ipc.sock" <<'PY' 2>/dev/null
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+s.settimeout(2)
+f = s.makefile()
+def q(prop):
+    s.sendall((json.dumps({"command": ["get_property", prop]}) + "\n").encode())
+    for _ in range(20):  # replies interleave with mpv events - scan for ours
+        try:
+            j = json.loads(f.readline())
+        except Exception:
+            return -1
+        if "data" in j or "error" in j:
+            return j.get("data", -1)
+    return -1
+print(f"{q('frame-drop-count')},{q('decoder-frame-drop-count')}")
+PY
+  )
+  echo "$name,$block,w3_vo_drops,${drops%%,*}" >>"$BENCH_CSV"
+  echo "$name,$block,w3_dec_drops,${drops##*,}" >>"$BENCH_CSV"
+  kill "$spid" "$mpid" 2>/dev/null
+  wait "$spid" "$mpid" 2>/dev/null
+  LOAD_PIDS=()
+  rm -f "$OUT/mpv-ipc.sock"
+  [[ $(<"$B/status") == Discharging ]] || {
+    log "ABORT: AC plugged during $name w3"
+    return 1
+  }
+}
+
 # ------------------------------------------------------------------- smoke
 run_smoke() {
   note "== SMOKE: apply/assert/revert every variant (no measurement)"
@@ -555,6 +658,23 @@ if w1:
     for var, blk, wall, j, m, rj in w1:
         lines.append("| %s | %d | %.1f | %.0f | %.0f | %.0f |" % (var, blk, wall, j, m, rj))
 
+# ---- W2/W3 per-phase power: fixed work (w2) / fixed rate (w3), so median W
+# over the window compares fairly across variants; delta vs A's same phase.
+for ph, label in (("w2", "W2 bursty-interactive (fixed chunk each 5s)"),
+                  ("w3", "W3 hw-decoded 1080p30 playback (the YouTube proxy)")):
+    per = {}
+    for x in S:
+        if x["phase"] == ph and x["status"] == "Discharging":
+            per.setdefault(x["variant"], []).append(x["watts"])
+    if not per: continue
+    a_med = med(per.get("A", []))
+    lines += ["", "## %s — median W over window" % label, "",
+              "| variant | median W | MAD | n | delta vs A |", "|---|---|---|---|---|"]
+    for var in sorted(per):
+        m = med(per[var])
+        d = ("%+.3f" % (m - a_med)) if a_med == a_med else "-"
+        lines.append("| %s | %.3f | %.3f | %d | %s |" % (var, m, mad(per[var]), len(per[var]), d))
+
 # ---- responsiveness
 BR = {}
 for var, blk, bench, val in rows("bench.csv", 4):
@@ -563,6 +683,9 @@ def pct(xs, p):
     xs = sorted(xs)
     return xs[min(len(xs) - 1, int(len(xs) * p))]
 benches = ["exec_ms", "pyspawn_ms", "st_chunk_ms", "hypr_ms", "wake_p50_us", "wake_p99_us"]
+# media-tier extras (already percentiles/counts — shown as single medians)
+for extra in ("w2_chunk_p50_ms", "w2_chunk_p95_ms", "w3_vo_drops", "w3_dec_drops"):
+    if any(b == extra for _, b in BR): benches.append(extra)
 variants = sorted({v for v, _ in BR})
 if BR:
     lines += ["", "## Responsiveness (p50 / p95; wake rows are medians of per-run p50/p99)", "",
@@ -573,7 +696,7 @@ if BR:
         for b in benches:
             xs = BR.get((var, b), [])
             if not xs: cells.append("-"); continue
-            if b.startswith("wake"):
+            if b.startswith(("wake", "w2", "w3")):
                 P[(var, b)] = med(xs); cells.append("%.0f" % med(xs))
             else:
                 P[(var, b)] = pct(xs, 0.95)
@@ -677,7 +800,7 @@ cleanup() {
   [[ -n $INIT_BRIGHTNESS ]] &&
     brightnessctl -d intel_backlight set "$INIT_BRIGHTNESS" >/dev/null 2>&1
   [[ -n $SUDO_KEEPALIVE ]] && kill "$SUDO_KEEPALIVE" 2>/dev/null
-  rm -f "$WORK_FILE" "$WORK_FILE.pool"
+  rm -f "$WORK_FILE" "$WORK_FILE.pool" "$VIDEO_FILE" "$OUT/mpv-ipc.sock"
   notify-send -u normal "A/B power test finished" \
     "Settings restored. Results: $OUT/summary.md" 2>/dev/null
   echo "restored; results in $OUT"
@@ -737,6 +860,18 @@ echo "epoch,msr_uj,mmio_uj" >"$RAPL_CSV"
 sudo -n bash -c "while kill -0 $$ 2>/dev/null; do echo \"\$(date +%s.%N),\$(cat $RAPL_MSR/energy_uj),\$(cat $RAPL_MMIO/energy_uj)\"; sleep 2; done" >>"$RAPL_CSV" &
 RAPL_PID=$!
 
+if [[ $TIER == media ]]; then
+  # 60s of encoded 1080p30 (looped by mpv). Synthetic content, but identical
+  # bits for every variant — and it exercises the real hw-decode path (gt1).
+  note "generating test video (one-time, ~30s)"
+  if ! ffmpeg -loglevel error -y -f lavfi -i testsrc2=size=1920x1080:rate=30 \
+    -t 60 -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p "$VIDEO_FILE"; then
+    note "ABORT: ffmpeg could not generate $VIDEO_FILE"
+    exit 1
+  fi
+fi
+
+if [[ $TIER != media ]]; then
 # EC sensor characterization (informational; analyze sanity-checks with it):
 # 20s quiet + 25s of 1-core load + 20s release, 4Hz current_now sampling.
 note "characterizing battery sensor (~65s)"
@@ -772,8 +907,10 @@ W1_MB=$(awk -v a="$T0" -v b="$T1" 'BEGIN{t=(b-a); mb=int(8*40/t); if(mb<24)mb=24
 head -c $((W1_MB * 1024 * 1024)) "$WORK_FILE.pool" >"$WORK_FILE"
 rm -f "$WORK_FILE.pool"
 echo "w1_size_mb=$W1_MB xz_8mb_s=$(awk -v a="$T0" -v b="$T1" 'BEGIN{printf "%.1f", b-a}')" >>"$META"
+fi # TIER != media
 
 EST=$((BLOCKS * (2 + ${#IDLE_VARIANTS[@]}) * 4 + ${#W1_VARIANTS[@]} * 5))
+[[ $TIER == media ]] && EST=$(((2 + ${#IDLE_VARIANTS[@]}) * 10))
 # -u normal, NOT critical: mako pins critical notifications until dismissed —
 # a popup that vanishes at an unknown time mid-run would change what PSR sees.
 notify-send -u normal -t 15000 "A/B power test started (~${EST} min)" \
@@ -796,8 +933,16 @@ for ((blk = 1; blk <= BLOCKS; blk++)); do
     VISIT=$((VISIT + 1))
     apply_variant "$v" || kill_run "apply failed for ${v%%|*}"
     snapshot_meta "idle-visit ${v%%|*}"
-    sample_loop "$CUR" "$blk" idle 60 || kill_run "AC during idle visit"
-    bench "$CUR" "$blk"
+    if [[ $TIER == media ]]; then
+      # shorter idle window (drift anchor only), then the two real-use loads
+      sample_loop "$CUR" "$blk" idle 50 || kill_run "AC during idle visit"
+      bench "$CUR" "$blk"
+      w2_run "$CUR" "$blk" || kill_run "w2 aborted for ${v%%|*}"
+      w3_run "$CUR" "$blk" || kill_run "w3 aborted for ${v%%|*}"
+    else
+      sample_loop "$CUR" "$blk" idle 60 || kill_run "AC during idle visit"
+      bench "$CUR" "$blk"
+    fi
   done
 done
 
