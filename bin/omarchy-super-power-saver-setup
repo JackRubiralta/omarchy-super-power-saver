@@ -505,6 +505,12 @@ apply_knobs() {
   # Test-gated (from /etc/omarchy-super-power-saver.conf), drift-guarded
   [[ -n $CPUIDLE_GOV && $(cat "$CPUIDLE" 2>/dev/null) != "$CPUIDLE_GOV" ]] &&
     w "$CPUIDLE_GOV" "$CPUIDLE"
+
+  # Explicit success: without this, the guarded conditional above makes the
+  # function exit 1 whenever the A/B governor is unset — the helper then
+  # reports failure for a fully successful apply (field bug 2026-07-08: the
+  # user script marked root_applied=no and never started the watcher).
+  return 0
 }
 
 apply() {
@@ -517,6 +523,7 @@ apply() {
     save || { rm -f "$RUN_STATE" "$RUN_STATE.tmp"; exit 1; }
   fi
   apply_knobs
+  return 0
 }
 
 restore() {

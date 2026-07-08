@@ -26,10 +26,13 @@ PSR_DEBUG=/sys/kernel/debug/dri/0000:00:02.0/i915_edp_psr_debug
 FAIL=0
 fail() { echo "ASSERT FAIL: $*" >&2; FAIL=1; }
 
-sudo -v || { echo "needs sudo" >&2; exit 1; }
+# Only the psr_debug read is root-only; without passwordless sudo it samples
+# empty in ALL snapshots (still a consistent diff), so don't hard-require it.
+sudo -n true 2>/dev/null ||
+  echo "NOTE: passwordless sudo unavailable here — psr_debug not sampled"
 
 rd() { cat "$1" 2>/dev/null; }
-srd() { sudo cat "$1" 2>/dev/null; }
+srd() { sudo -n cat "$1" 2>/dev/null; }
 
 fp_dev() {
   local d
@@ -41,6 +44,7 @@ fp_dev() {
 
 snapshot() { # <name>
   local n="$OUT/$1" fp
+  rm -f "$n.volatile"
   fp=$(fp_dev)
   {
     echo "ppd_profile=$(powerprofilesctl get 2>/dev/null)"
@@ -51,13 +55,18 @@ snapshot() { # <name>
     echo "max_perf_pct=$(rd /sys/devices/system/cpu/intel_pstate/max_perf_pct)"
     echo "cpus_online=$(rd /sys/devices/system/cpu/online)"
     echo "cpuidle_governor=$(rd /sys/devices/system/cpu/cpuidle/current_governor)"
+    # RAPL power limits are VOLATILE when the mode is off (thermald/Dell DPTF
+    # rewrites them continuously on AC) — sampled to $n.volatile, excluded
+    # from the strict diff; a leak of OUR caps is asserted separately below.
     local z t
     for z in "$RAPL_MSR" "$RAPL_MMIO"; do
       t=$(basename "$z")
-      echo "${t}_pl1=$(rd "$z/constraint_0_power_limit_uw")"
-      echo "${t}_tau=$(rd "$z/constraint_0_time_window_us")"
-      echo "${t}_pl2=$(rd "$z/constraint_1_power_limit_uw")"
-      echo "${t}_pl4=$(rd "$z/constraint_2_power_limit_uw")"
+      {
+        echo "${t}_pl1=$(rd "$z/constraint_0_power_limit_uw")"
+        echo "${t}_tau=$(rd "$z/constraint_0_time_window_us")"
+        echo "${t}_pl2=$(rd "$z/constraint_1_power_limit_uw")"
+        echo "${t}_pl4=$(rd "$z/constraint_2_power_limit_uw")"
+      } >>"$n.volatile"
       echo "${t}_enabled=$(rd "$z/enabled")"
     done
     echo "aspm=$(rd /sys/module/pcie_aspm/parameters/policy)"
@@ -128,12 +137,17 @@ expect() { # key expected — against the mid snapshot
   got=$(grep "^$1=" "$OUT/mid" | cut -d= -f2-)
   [[ $got == "$2" ]] || fail "mid: $1 = '$got', expected '$2'"
 }
+expect_v() { # key expected — against the mid VOLATILE snapshot (RAPL)
+  local got
+  got=$(grep "^$1=" "$OUT/mid.volatile" | cut -d= -f2-)
+  [[ $got == "$2" ]] || fail "mid: $1 = '$got', expected '$2'"
+}
 watch_pl1=$(grep '^watch_pl1=' "$STATE_FILE" | cut -d= -f2)
 expect cpus_online "0,14-15"
 expect ppd_profile "power-saver"
 expect platform_profile "quiet"
-expect intel-rapl:0_pl1 "${watch_pl1:-10000000}"
-expect intel-rapl:0_pl4 "25000000"
+expect_v intel-rapl:0_pl1 "${watch_pl1:-10000000}"
+expect_v intel-rapl:0_pl4 "25000000"
 expect cg_user_allowed "14-15"
 expect cg_user_cpus "14-15"
 expect snd_power_save "1"
@@ -163,6 +177,18 @@ else
   fail "pre/post snapshots differ (see above)"
   diff -u "$OUT/pre.irqs" "$OUT/post.irqs" | head -30
 fi
+
+# RAPL leak check (soft — exact values are thermald-managed when off): the
+# mode's own caps must NOT survive. Anything ≥20W PL1 / >15W PL2 / >25W PL4
+# means thermald/DPTF is back in charge, which is stock.
+k() { grep "^$1=" "$OUT/post.volatile" | cut -d= -f2; }
+for z in intel-rapl:0 intel-rapl-mmio:0; do
+  [[ $(k "${z}_pl1") -ge 20000000 ]] || fail "post: ${z} PL1=$(k "${z}_pl1") — mode cap leaked"
+  [[ $(k "${z}_pl2") -gt 15000000 ]] || fail "post: ${z} PL2=$(k "${z}_pl2") — mode cap leaked"
+  [[ $(k "${z}_pl4") -gt 25000000 ]] || fail "post: ${z} PL4=$(k "${z}_pl4") — mode clamp leaked"
+done
+echo "RAPL pre/post (thermald-managed while off, informational):"
+diff --side-by-side "$OUT/pre.volatile" "$OUT/post.volatile" | sed 's/^/  /' || true
 
 if [[ $FAIL == 0 ]]; then
   echo "== PASS"

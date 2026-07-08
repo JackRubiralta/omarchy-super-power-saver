@@ -242,6 +242,7 @@ do_on() {
   [[ $root_applied == yes ]] && start_watcher
   # No mode-change notifications (user preference 2026-07-08); the root_helper
   # failure notification is the only exception.
+  return 0
 }
 
 do_off() {
