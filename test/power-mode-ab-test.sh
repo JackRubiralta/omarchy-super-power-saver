@@ -16,7 +16,12 @@
 #                                          #   round over D / E / B (real-use
 #                                          #   proxy: the "watching YouTube"
 #                                          #   question)
-#   power-mode-ab-test.sh thorough [outdir]# ~3 h unattended ON BATTERY
+#   power-mode-ab-test.sh thorough [outdir]# ~3 h ON BATTERY: the full best-
+#                                          #   settings search — idle matrix
+#                                          #   (6 variants x 2 blocks), real-use
+#                                          #   round (browse/video/burst),
+#                                          #   fixed-work + PL1 sweep, browser
+#                                          #   hw/sw decode
 #   power-mode-ab-test.sh analyze <outdir> # recompute stats from raw CSVs
 #
 # Launch from YOUR terminal (it prompts sudo once, then keeps the timestamp
@@ -88,27 +93,42 @@ V_C="C|super|SPS_ALLOWED_CPUS=14-15" # strict LP-E pin (pre-2026-07-08 default)
 V_D="D|super|" # shipped default since 2026-07-08: pin 0,14-15 (measured winner)
 V_E="E|super|SPS_ONLINE_CPUS=0,6-7,14-15;SPS_ALLOWED_CPUS=0,6-7,14-15;SPS_IRQ_STEER=1"
 V_F="F|super|SPS_CPUIDLE_GOV=teo"
+V_G8="G8|super|SPS_PL1_UW=8000000" # D topology, PL1 10W->8W (load-only: PL1 is ~irrelevant at idle)
+V_G6="G6|super|SPS_PL1_UW=6000000" # D topology, PL1 6W
 V_BAL="BAL|stock|balanced"
 V_PERF="PERF|stock|performance"
 
+# Per-tier phases:
+#   IDLE_BLOCKS x [A, shuffled IDLE_VARIANTS, A]  — idle W + responsiveness
+#   one [A, shuffled REALUSE_VARIANTS, A] block   — + bursty/video/browsing
+#   BROWSER_PHASE                                  — hw-vs-sw decode, both browsers
+#   W1_VARIANTS                                    — fixed-work joules (+ PL1 sweep)
 case $TIER in
 quick)
   IDLE_VARIANTS=("$V_B" "$V_C" "$V_D")
+  REALUSE_VARIANTS=()
   W1_VARIANTS=("$V_B" "$V_C" "$V_D")
-  BLOCKS=1 SOC_FLOOR=40
+  BROWSER_PHASE=0
+  IDLE_BLOCKS=1 SOC_FLOOR=40
   ;;
 media)
-  # Real-use round: which topology is cheapest for fixed-RATE work (hw-decoded
-  # video = the YouTube proxy, where mean W IS joules-per-work) and for bursty
-  # interactive work, and does the E-core-pair variant buy smoothness?
-  IDLE_VARIANTS=("$V_D" "$V_E" "$V_B")
+  # Real-use round only: which topology is cheapest for fixed-RATE work
+  # (hw-decoded video = the YouTube proxy, where mean W IS joules-per-work),
+  # for bursty interactive work, and for actual Firefox browsing.
+  IDLE_VARIANTS=()
+  REALUSE_VARIANTS=("$V_D" "$V_E" "$V_B")
   W1_VARIANTS=()
-  BLOCKS=1 SOC_FLOOR=45
+  BROWSER_PHASE=1
+  IDLE_BLOCKS=0 SOC_FLOOR=45
   ;;
 thorough)
+  # The full best-settings search (~3h): complete idle matrix, real-use round
+  # on the topology contenders, fixed-work + PL1 sweep, browser decode A/B.
   IDLE_VARIANTS=("$V_B" "$V_B2" "$V_C" "$V_D" "$V_E" "$V_F")
-  W1_VARIANTS=("$V_A" "$V_B" "$V_C" "$V_D")
-  BLOCKS=3 SOC_FLOOR=75
+  REALUSE_VARIANTS=("$V_D" "$V_E" "$V_B")
+  W1_VARIANTS=("$V_A" "$V_B" "$V_C" "$V_D" "$V_G8" "$V_G6")
+  BROWSER_PHASE=1
+  IDLE_BLOCKS=2 SOC_FLOOR=70
   ;;
 esac
 
@@ -989,7 +1009,7 @@ echo "epoch,msr_uj,mmio_uj" >"$RAPL_CSV"
 sudo -n bash -c "while kill -0 $$ 2>/dev/null; do echo \"\$(date +%s.%N),\$(cat $RAPL_MSR/energy_uj),\$(cat $RAPL_MMIO/energy_uj)\"; sleep 2; done" >>"$RAPL_CSV" &
 RAPL_PID=$!
 
-if [[ $TIER == media ]]; then
+if ((${#REALUSE_VARIANTS[@]})) || [[ $BROWSER_PHASE == 1 ]]; then
   # 60s of encoded 1080p30 (looped by mpv). Synthetic content, but identical
   # bits for every variant — and it exercises the real hw-decode path (gt1).
   note "generating test video (one-time, ~30s)"
@@ -1050,7 +1070,7 @@ print("browse pages ready")
 PY
 fi
 
-if [[ $TIER != media ]]; then
+if ((${#W1_VARIANTS[@]})); then
 # EC sensor characterization (informational; analyze sanity-checks with it):
 # 20s quiet + 25s of 1-core load + 20s release, 4Hz current_now sampling.
 note "characterizing battery sensor (~65s)"
@@ -1086,10 +1106,11 @@ W1_MB=$(awk -v a="$T0" -v b="$T1" 'BEGIN{t=(b-a); mb=int(8*40/t); if(mb<24)mb=24
 head -c $((W1_MB * 1024 * 1024)) "$WORK_FILE.pool" >"$WORK_FILE"
 rm -f "$WORK_FILE.pool"
 echo "w1_size_mb=$W1_MB xz_8mb_s=$(awk -v a="$T0" -v b="$T1" 'BEGIN{printf "%.1f", b-a}')" >>"$META"
-fi # TIER != media
+fi # W1_VARIANTS non-empty
 
-EST=$((BLOCKS * (2 + ${#IDLE_VARIANTS[@]}) * 4 + ${#W1_VARIANTS[@]} * 5))
-[[ $TIER == media ]] && EST=$(((2 + ${#IDLE_VARIANTS[@]}) * 13 + 16)) # idle+bench+w2+w3+w6 per visit, + browser hw/sw phase
+EST=$((IDLE_BLOCKS * (2 + ${#IDLE_VARIANTS[@]}) * 4 + ${#W1_VARIANTS[@]} * 5))
+((${#REALUSE_VARIANTS[@]})) && EST=$((EST + (2 + ${#REALUSE_VARIANTS[@]}) * 13))
+[[ $BROWSER_PHASE == 1 ]] && EST=$((EST + 16))
 # -u normal, NOT critical: mako pins critical notifications until dismissed —
 # a popup that vanishes at an unknown time mid-run would change what PSR sees.
 notify-send -u normal -t 15000 "A/B power test started (~${EST} min)" \
@@ -1105,28 +1126,37 @@ kill_run() {
   exit 1
 }
 
-for ((blk = 1; blk <= BLOCKS; blk++)); do
+for ((blk = 1; blk <= IDLE_BLOCKS; blk++)); do
   mapfile -t shuffled < <(printf '%s\n' "${IDLE_VARIANTS[@]}" | shuf)
-  log "block $blk order: A $(for v in "${shuffled[@]}"; do printf '%s ' "${v%%|*}"; done)A"
+  log "idle block $blk order: A $(for v in "${shuffled[@]}"; do printf '%s ' "${v%%|*}"; done)A"
   for v in "$V_A" "${shuffled[@]}" "$V_A"; do
     VISIT=$((VISIT + 1))
     apply_variant "$v" || kill_run "apply failed for ${v%%|*}"
     snapshot_meta "idle-visit ${v%%|*}"
-    if [[ $TIER == media ]]; then
-      # shorter idle window (drift anchor only), then the two real-use loads
-      sample_loop "$CUR" "$blk" idle 50 || kill_run "AC during idle visit"
-      bench "$CUR" "$blk"
-      w2_run "$CUR" "$blk" || kill_run "w2 aborted for ${v%%|*}"
-      w3_run "$CUR" "$blk" || kill_run "w3 aborted for ${v%%|*}"
-      w6_run "$CUR" "$blk" || kill_run "w6 aborted for ${v%%|*}"
-    else
-      sample_loop "$CUR" "$blk" idle 60 || kill_run "AC during idle visit"
-      bench "$CUR" "$blk"
-    fi
+    sample_loop "$CUR" "$blk" idle 60 || kill_run "AC during idle visit"
+    bench "$CUR" "$blk"
   done
 done
 
-if [[ $TIER == media ]]; then
+if ((${#REALUSE_VARIANTS[@]})); then
+  # Real-use bracket block: its 50-sample idle anchors feed the same idle-
+  # delta analysis as the idle blocks (one more block of sign evidence).
+  blk=$((IDLE_BLOCKS + 1))
+  mapfile -t shuffled < <(printf '%s\n' "${REALUSE_VARIANTS[@]}" | shuf)
+  log "real-use block order: A $(for v in "${shuffled[@]}"; do printf '%s ' "${v%%|*}"; done)A"
+  for v in "$V_A" "${shuffled[@]}" "$V_A"; do
+    VISIT=$((VISIT + 1))
+    apply_variant "$v" || kill_run "apply failed for ${v%%|*}"
+    snapshot_meta "realuse-visit ${v%%|*}"
+    sample_loop "$CUR" "$blk" idle 50 || kill_run "AC during idle anchor"
+    bench "$CUR" "$blk"
+    w2_run "$CUR" "$blk" || kill_run "w2 aborted for ${v%%|*}"
+    w3_run "$CUR" "$blk" || kill_run "w3 aborted for ${v%%|*}"
+    w6_run "$CUR" "$blk" || kill_run "w6 aborted for ${v%%|*}"
+  done
+fi
+
+if [[ $BROWSER_PHASE == 1 ]]; then
   log "browser phase (on shipped default D): hw vs sw decode, both browsers"
   apply_variant "$V_D" || kill_run "apply failed for D (browser phase)"
   snapshot_meta "browser D"
@@ -1136,13 +1166,15 @@ if [[ $TIER == media ]]; then
   done
 fi
 
-log "W1 phase"
-mapfile -t w1shuffled < <(printf '%s\n' "${W1_VARIANTS[@]}" | shuf)
-for v in "${w1shuffled[@]}"; do
-  apply_variant "$v" || kill_run "apply failed for ${v%%|*} (w1)"
-  snapshot_meta "w1 ${v%%|*}"
-  w1_run "$CUR" 1 || kill_run "w1 aborted for ${v%%|*}"
-done
+if ((${#W1_VARIANTS[@]})); then
+  log "W1 phase"
+  mapfile -t w1shuffled < <(printf '%s\n' "${W1_VARIANTS[@]}" | shuf)
+  for v in "${w1shuffled[@]}"; do
+    apply_variant "$v" || kill_run "apply failed for ${v%%|*} (w1)"
+    snapshot_meta "w1 ${v%%|*}"
+    w1_run "$CUR" 1 || kill_run "w1 aborted for ${v%%|*}"
+  done
+fi
 
 "$SPS" off >/dev/null 2>&1
 echo "end=$(date -Is) capacity=$(cat "$B/capacity")%" >>"$META"

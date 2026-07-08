@@ -94,7 +94,11 @@ are the measured sweet spot.
 ```sh
 ./test/power-mode-ab-test.sh smoke     # ~3 min: apply/assert/revert every consolidation variant
 ./test/power-mode-ab-test.sh quick     # ~40 min on battery: stock vs consolidation ablations
-./test/power-mode-ab-test.sh thorough  # ~3 h: full variant matrix, 3 interleaved blocks
+./test/power-mode-ab-test.sh media     # ~80 min on battery: real-use round — Firefox browsing,
+                                       #   hw video playback, bursty load, browser hw/sw decode
+./test/power-mode-ab-test.sh thorough  # ~3 h: the full best-settings search — idle matrix
+                                       #   (6 variants x 2 blocks), real-use round, fixed-work
+                                       #   + PL1 sweep, browser hw/sw decode
 ./test/power-mode-scope-test.sh        # scope-exactness: on→off must restore ~50 knobs byte-identically
 ./test/power-mode-test.sh <outdir>     # battery drain protocol (idle/light/burst per mode, on battery)
 ```
