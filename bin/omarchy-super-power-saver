@@ -16,10 +16,11 @@
 #              uncore freq floor, render-GT capped to efficient freq (media GT
 #              left SLPC-managed for video decode), SLPC power_saving profile
 #              (gt0+gt1), LP-E consolidation: P-cores 1-5 AND E-cores 6-13
-#              offline + user/system/machine.slice pinned to cpu0 + the LP-E
-#              pair (default SPS_ALLOWED_CPUS=0,14-15 since the measured A/B
-#              2026-07-08; strict LP-E pin one conf line away) + device IRQs
-#              steered to the same set, PSR2
+#              consolidation OFF by default since the thorough A/B 2026-07-16
+#              (all-cores-free tied the best pin on energy at stock-level
+#              responsiveness); offlining/pinning/IRQ-steering remain
+#              conf-driven variants (SPS_ONLINE_CPUS/SPS_ALLOWED_CPUS/
+#              SPS_IRQ_STEER), PSR2
 #              assert, fingerprint autosuspend, snd_hda power_save 1s,
 #              snapper-timeline.timer paused, nmi_watchdog=0, writeback 60s.
 # Deliberately untouched: Hyprland animations/blur/shadows (identical in ALL

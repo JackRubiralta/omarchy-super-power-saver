@@ -579,3 +579,36 @@ diag documented as deliberately lock-free; stale topology text in the user
 script header, design notes v4.2 section, README, and install.sh manifest
 brought in line with the 0,14-15 default. One finding refuted (platform_
 profile snapshot is restored via ppd, not directly — correct as written).
+
+### v4.3 (2026-07-16) — thorough-tier verdict: consolidation OFF by default
+
+The full matrix (2 bracketed idle blocks x 6 variants + real-use round with
+actual Firefox browsing) reversed the consolidation story. Numbers (median
+delta vs stock power-saver; blocks sign-consistent):
+
+- idle: C -0.46W, B2 -0.35W, B -0.32W, D -0.27W, E -0.15W, F ~0
+- Firefox browsing: D -0.82W, E -0.73W, B -0.69W (stock 7.19W)
+- bursty: D -0.54W, E -0.47W, B -0.39W
+- mpv video: all within 0.11W of stock (decode is on the media engine;
+  topology irrelevant); zero dropped frames everywhere
+- lag budget: B 1.1x (stock feel), E 1.3x pass; D 2.1x fail, F/B2/C fail
+
+Weighted for a realistic day (idle-dominant), B and D tie at ~-0.36W average
+— but B is unconfined and cannot lag. The pinning machinery just moves
+savings from load to idle while charging latency for it. Shipped default is
+now **B: SPS_ONLINE_CPUS=0-15, SPS_ALLOWED_CPUS='', SPS_IRQ_STEER=0** — the
+mode is the RAPL caps + quiet profile + fabric/GPU/device knobs, with the
+whole consolidation stack intact as conf variants (C for max idle savings
+when responsiveness doesn't matter, e.g. unplugged overnight).
+
+Run post-mortem: the browser hw/sw-decode phase crashed at the 2.2h mark on
+`local ... ph="${br:0:2}..."` — word expansion of a `local` list happens
+BEFORE its assignments land, so ${br} was unbound under set -u (that phase
+had never executed live; smoke/quick don't reach it). Fixed by splitting the
+line; a `loads` tier (~45 min: W1 + PL1 sweep + browser decode A/B) recovers
+the two lost phases without a 3h re-run. Threshold logic also improved: one
+polluted first visit (block-1 A-noise 0.53W) had inflated the max-noise gate
+past every real effect — now median per-block noise.
+
+F (teo governor): no idle benefit, worse latency — rejected, do not re-try.
+B2 (pin without offlining): strictly dominated by C — rejected.

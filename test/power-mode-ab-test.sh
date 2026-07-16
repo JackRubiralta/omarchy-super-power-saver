@@ -16,6 +16,8 @@
 #                                          #   round over D / E / B (real-use
 #                                          #   proxy: the "watching YouTube"
 #                                          #   question)
+#   power-mode-ab-test.sh loads  [outdir]  # ~45 min ON BATTERY: fixed-work +
+#                                          #   PL1 sweep + browser hw/sw decode
 #   power-mode-ab-test.sh thorough [outdir]# ~3 h ON BATTERY: the full best-
 #                                          #   settings search — idle matrix
 #                                          #   (6 variants x 2 blocks), real-use
@@ -47,7 +49,7 @@ LC_ALL=C
 LANG=C
 
 TIER="${1:-}"
-case $TIER in smoke | quick | media | thorough | analyze) ;; *)
+case $TIER in smoke | quick | media | loads | thorough | analyze) ;; *)
   sed -n '/^# Usage:/,/^# touch the laptop/p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
   ;;
@@ -90,14 +92,14 @@ TIMER_CANDIDATES="snapper-timeline.timer snapper-cleanup.timer plocate-updatedb.
 # Expected topology per super variant is derived from the fragment with the
 # same cpulist code the helper uses.
 V_A="A|stock|power-saver"
-V_B="B|super|SPS_ONLINE_CPUS=0-15;SPS_ALLOWED_CPUS=;SPS_IRQ_STEER=0"
+V_B="B|super|" # shipped default since 2026-07-16: no consolidation (thorough-tier winner)
 V_B2="B2|super|SPS_ONLINE_CPUS=0-15;SPS_ALLOWED_CPUS=14-15;SPS_IRQ_STEER=1"
 V_C="C|super|SPS_ALLOWED_CPUS=14-15" # strict LP-E pin (pre-2026-07-08 default)
-V_D="D|super|" # shipped default since 2026-07-08: pin 0,14-15 (measured winner)
+V_D="D|super|SPS_ONLINE_CPUS=0,14-15;SPS_ALLOWED_CPUS=0,14-15;SPS_IRQ_STEER=1" # cpu0+LP-E pin (2026-07-08..16 default)
 V_E="E|super|SPS_ONLINE_CPUS=0,6-7,14-15;SPS_ALLOWED_CPUS=0,6-7,14-15;SPS_IRQ_STEER=1"
 V_F="F|super|SPS_CPUIDLE_GOV=teo"
-V_G8="G8|super|SPS_PL1_UW=8000000" # D topology, PL1 10W->8W (load-only: PL1 is ~irrelevant at idle)
-V_G6="G6|super|SPS_PL1_UW=6000000" # D topology, PL1 6W
+V_G8="G8|super|SPS_PL1_UW=8000000" # shipped-default topology, PL1 10W->8W (load-only)
+V_G6="G6|super|SPS_PL1_UW=6000000" # shipped-default topology, PL1 6W
 V_BAL="BAL|stock|balanced"
 V_PERF="PERF|stock|performance"
 
@@ -126,6 +128,15 @@ media)
   IDLE_VARIANTS=()
   REALUSE_VARIANTS=("$V_D" "$V_E" "$V_B")
   W1_VARIANTS=()
+  BROWSER_PHASE=1
+  IDLE_BLOCKS=0 SOC_FLOOR=45
+  ;;
+loads)
+  # Recovery/companion tier (~45 min): just the load phases — fixed-work
+  # joules + PL1 sweep and the browser hw/sw decode A/B.
+  IDLE_VARIANTS=()
+  REALUSE_VARIANTS=()
+  W1_VARIANTS=("$V_A" "$V_B" "$V_C" "$V_D" "$V_G8" "$V_G6")
   BROWSER_PHASE=1
   IDLE_BLOCKS=0 SOC_FLOOR=45
   ;;
@@ -181,7 +192,7 @@ mask_of_cpulist() {
 # Derive expected topology from a super variant's conf fragment (defaults =
 # the helper's shipped defaults). Sets EXP_ONLINE, EXP_PIN, EXP_MASK, EXP_STEER.
 derive_expect() { # conf-fragment
-  EXP_ONLINE="0,14-15" EXP_PIN="0,14-15" EXP_STEER=1 # = helper shipped defaults
+  EXP_ONLINE="0-15" EXP_PIN="" EXP_STEER=0 # = helper shipped defaults (B, 2026-07-16)
   local kv k v
   local IFS=';'
   for kv in $1; do
@@ -613,7 +624,11 @@ w6_run() { # variant block
 # work is worth. A background probe records the media engine's actual
 # frequency: nonzero = hardware decode really engaged (not just configured).
 browser_run() { # variant block browser(chromium|firefox) decode(hw|sw)
-  local name=$1 block=$2 br=$3 dec=$4 ph="${br:0:2}${dec}" bpid spid gpid
+  local name=$1 block=$2 br=$3 dec=$4 bpid spid gpid
+  # separate line: word expansion of a `local` list happens BEFORE any of its
+  # assignments land, so ${br:0:2} on the same line is an unbound-variable
+  # abort under set -u (killed the 2026-07-16 thorough run at the 2.2h mark)
+  local ph="${br:0:2}${dec}"
   local prof="$OUT/prof-$br-$dec"
   mkdir -p "$prof"
   case $br in
@@ -721,10 +736,10 @@ run_smoke() {
   note "-- malformed conf falls back to shipped defaults"
   write_conf "SPS_ONLINE_CPUS=banana;SPS_ALLOWED_CPUS=0-99;SPS_IRQ_STEER=2"
   "$SPS" on >/dev/null 2>&1
-  chk "$([[ $(cat /sys/devices/system/cpu/online) == 0,14-15 ]]; echo $?)" \
-    "bad conf -> default online 0,14-15 (got $(cat /sys/devices/system/cpu/online))"
-  chk "$([[ $(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null) == 0,14-15 ]]; echo $?)" \
-    "bad conf -> default pin 0,14-15 (got '$(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null)')"
+  chk "$([[ $(cat /sys/devices/system/cpu/online) == 0-15 ]]; echo $?)" \
+    "bad conf -> default online 0-15 (got $(cat /sys/devices/system/cpu/online))"
+  chk "$([[ -z $(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null) ]]; echo $?)" \
+    "bad conf -> default no pin (got '$(cat /sys/fs/cgroup/user.slice/cpuset.cpus 2>/dev/null)')"
   chk "$(sudo -n grep -q 'bad SPS_ONLINE_CPUS' /run/omarchy-super-power-saver.drift; echo $?)" \
     "bad conf -> drift log has rejection lines"
   "$SPS" off >/dev/null 2>&1
@@ -805,7 +820,9 @@ for blk in sorted({v["block"] for v in usable.values()}):
         base = a0["med"] + (a1["med"] - a0["med"]) * (v["mid"] - a0["mid"]) / span
         deltas.setdefault(v["variant"], []).append(v["med"] - base)
 
-thr = max(0.3 if tier == "quick" else 0.2, 2 * (max(a_noise) if a_noise else 0))
+# median, not max: one polluted block (e.g. a hot first visit) must not
+# gate every other block's tight, sign-consistent evidence
+thr = max(0.3 if tier == "quick" else 0.2, 2 * (st.median(a_noise) if a_noise else 0))
 lines += ["", "## Idle delta vs stock power-saver (baseline-bracket corrected)", "",
           "decision threshold: |delta| >= %.3f W and same sign across blocks (A-repeat noise %s)" %
           (thr, ",".join("%.3f" % x for x in a_noise)),
@@ -841,7 +858,7 @@ for (var, blk), ev in sorted(EV.items()):
     # PL1-sweep variants share D's topology but have no idle visits of their
     # own — without a baseline their integration window would be biased long
     # (fixed 30s tail) versus everyone else's detected idle-return.
-    base_var = {"G8": "D", "G6": "D"}.get(var, var)
+    base_var = {"G8": "B", "G6": "B"}.get(var, var)  # PL1 variants share the shipped (B) topology
     idle = med([visits[k]["med"] for k in visits if visits[k]["variant"] == base_var]) if any(
         visits[k]["variant"] == base_var for k in visits) else float("nan")
     pts = sorted((s["epoch"], s["watts"]) for s in S

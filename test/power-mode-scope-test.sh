@@ -31,7 +31,7 @@ fail() { echo "ASSERT FAIL: $*" >&2; FAIL=1; }
 # mid-snapshot asserts must track /etc/omarchy-super-power-saver.conf instead
 # of hardcoding the stock 0,14-15 island, or every A/B variant "fails".
 CONF=/etc/omarchy-super-power-saver.conf
-EXP_ONLINE="0,14-15" EXP_PIN="0,14-15" EXP_STEER=1 # shipped defaults (pin includes cpu0 since the 2026-07-08 A/B run)
+EXP_ONLINE="0-15" EXP_PIN="" EXP_STEER=0 # shipped defaults: NO consolidation (thorough A/B, 2026-07-16)
 
 expand_cpulist() {
   local out=() part a b i IFS=,

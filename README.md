@@ -16,7 +16,7 @@ On top of ppd `power-saver` (EPP=power, Dell platform_profile `quiet`):
 
 | Layer | Knob |
 |---|---|
-| CPU | **LP-E island consolidation**: P-cores 1-5 + E-cores 6-13 offlined; `user/system/machine.slice` pinned to cpu0 + the low-power SoC-tile cores (cpu14-15) via `AllowedCPUs`; device IRQs + `default_smp_affinity` steered to the same set (managed NVMe queue IRQs and the dGPU are left alone). cpu0 is in the pin since the measured A/B (see below): it can't be offlined anyway, and letting bursts race-to-idle on it is both faster **and** cheaper than forcing everything onto the 2.5 GHz LP-E pair |
+| CPU | **No core confinement by default** (since the 2026-07-16 thorough A/B): all 16 CPUs stay online and free — measured statistically tied on total energy with the best cgroup-pinned variant, at stock responsiveness. The full consolidation machinery (offlining, `AllowedCPUs` pinning, IRQ steering) remains available as conf variants (`SPS_ONLINE_CPUS`/`SPS_ALLOWED_CPUS`/`SPS_IRQ_STEER`) for max-idle-savings use |
 | CPU | RAPL PL1=10W (tau 8s) / PL2=15W / **PL4=25W** in both MSR and MMIO zones; EPB=15; thermald paused (it would raise the caps) |
 | Fabric | uncore frequency pinned to its floor; `pcie_aspm=powersupersave` |
 | iGPU | render GT capped to its efficient frequency; **SLPC `power_saving` profile** on both GTs (kills waitboost); media GT frequency range untouched (video decode) |
@@ -76,9 +76,9 @@ Create `/etc/omarchy-super-power-saver.conf` (must be root-owned, mode 644):
 SPS_CPUIDLE_GOV=teo        # cpuidle governor while the mode is on
 SPS_PL1_UW=7000000         # long-term power cap variant (default 10W)
 SPS_PL2_UW=10000000        # short-term cap variant (default 15W)
-SPS_ONLINE_CPUS=0,14-15    # CPUs kept online (must contain 0, 14, 15)
-SPS_ALLOWED_CPUS=0,14-15   # slice AllowedCPUs pin (subset of online; empty = no pin)
-SPS_IRQ_STEER=1            # 0 = leave IRQ affinities alone
+SPS_ONLINE_CPUS=0-15       # CPUs kept online (default: all; must contain 0, 14, 15)
+SPS_ALLOWED_CPUS=          # slice AllowedCPUs pin (default: none; subset of online)
+SPS_IRQ_STEER=0            # 1 = steer IRQs to the pin/online set
 ```
 
 Toggle the mode off→on to apply — topology keys especially: `reassert`
@@ -111,6 +111,23 @@ and a lag budget (process-spawn p95 ≤ 2× stock, timer-wakeup p99 ≤ 1.5×
 stock) that turns "feels laggy" into a pass/fail line. Results land in
 `test/results/` (gitignored); `analyze <outdir>` recomputes the report from
 the raw CSVs.
+
+### Measured (2026-07-16, thorough tier: 3 bracketed blocks + real-use round)
+
+| variant | idle Δ vs stock power-saver | Firefox browsing Δ | bursty Δ | responsiveness vs stock |
+|---|---|---|---|---|
+| **B — no consolidation (shipped default)** | **−0.32 W** | −0.69 W | −0.39 W | **1.1× (stock feel)** |
+| D — pin cpu0+LP-E | −0.27 W | −0.82 W | −0.54 W | 2.1× spawn (fails budget) |
+| E — cpu0+E-pair+LP-E | −0.15 W | −0.73 W | −0.47 W | 1.3× (passes) |
+| C — strict LP-E pin | −0.46 W | — | — | 4× spawn (fails hard) |
+| F — teo governor | ~0 | — | — | fails; dead end |
+
+Verdict: weighted for real use, **B and D tie on total energy — and B has
+stock responsiveness by construction** (nothing is confined). The
+consolidation apparatus only moves savings from load to idle while adding
+latency, so the shipped default is now B; C/D/E remain one conf line away.
+Video playback power was identical across all variants (hw decode runs on
+the media engine regardless), zero dropped frames everywhere.
 
 ### Measured (2026-07-08, quick tier, reference machine on battery)
 
